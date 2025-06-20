@@ -4,18 +4,29 @@ pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
-contract GraphiteDNSRegistry is ERC721, AccessControl, Pausable, ReentrancyGuard, EIP712 {
+contract GraphiteDNSRegistry is
+    ERC721,
+    AccessControl,
+    Pausable,
+    ReentrancyGuard,
+    EIP712
+{
+    using ECDSA for bytes32;
+    bytes32 public constant override DEFAULT_ADMIN_ROLE = 0x00; // from AccessControl
     bytes32 public constant REGISTRAR_ROLE = keccak256("REGISTRAR_ROLE");
-    bytes32 public constant PAUSER_ROLE    = keccak256("PAUSER_ROLE");
-    bytes32 public constant RESOLVER_ROLE  = keccak256("RESOLVER_ROLE");
+    bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+    bytes32 public constant RESOLVER_ROLE = keccak256("RESOLVER_ROLE");
 
     uint256 public nextId = 1;
     uint256 public gracePeriod = 90 days;
-    uint256 public maxRegistration = 10 * 365 days;
+    uint256 public maxRegistration = 10 * 365 days; // 10 years
+    uint256 public baseFee = 0.01 ether;
+    uint256 public constant MAX_NAME_LENGTH = 32;
 
     struct Domain {
         address owner;
@@ -24,15 +35,24 @@ contract GraphiteDNSRegistry is ERC721, AccessControl, Pausable, ReentrancyGuard
         bytes32 parent;
     }
 
-    mapping(bytes32 => Domain)   private _domains;
-    mapping(bytes32 => string)   private _labels;
-    mapping(string => bytes32)   private _nodeOfLabel;
-    mapping(address => mapping(uint256 => bool)) private _usedNonces;
+    mapping(bytes32 => Domain) internal _domains;
+    mapping(bytes32 => string) internal _labels;
+    mapping(string => bytes32) internal _nodeOfLabel;
 
-    bytes32 private constant _TRANSFER_TYPEHASH = 
-        keccak256("Transfer(bytes32 node,address from,address to,uint256 nonce,uint256 deadline)");
+    // FIXED-PRICE
+    mapping(bytes32 => uint256) private _fixedPrice;
 
-    event DomainRegistered(bytes32 indexed node, string label, address owner, uint64 expiry);
+    bytes32 private constant _TRANSFER_TYPEHASH =
+        keccak256(
+            "Transfer(bytes32 node,address from,address to,uint256 nonce,uint256 deadline)"
+        );
+
+    event DomainRegistered(
+        bytes32 indexed node,
+        string label,
+        address owner,
+        uint64 expiry
+    );
     event DomainTransferred(bytes32 indexed node, address from, address to);
     event ResolverUpdated(bytes32 indexed node, address resolver);
 
@@ -46,18 +66,28 @@ contract GraphiteDNSRegistry is ERC721, AccessControl, Pausable, ReentrancyGuard
         _grantRole(RESOLVER_ROLE, msg.sender);
     }
 
-    function pause() external onlyRole(PAUSER_ROLE) { _pause(); }
-    function unpause() external onlyRole(PAUSER_ROLE) { _unpause(); }
+    // ─── PAUSE ───────────────────────────────────────────────────────
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
 
-    function _makeNode(bytes32 parent, string memory label) internal pure returns(bytes32) {
+    // ─── HELPERS ─────────────────────────────────────────────────────
+    function _makeNode(
+        bytes32 parent,
+        string memory label
+    ) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked(parent, keccak256(bytes(label))));
     }
-
     function isAvailable(bytes32 node) public view returns (bool) {
         Domain storage d = _domains[node];
-        return d.owner == address(0) || block.timestamp > d.expiry + gracePeriod;
+        return
+            d.owner == address(0) || block.timestamp > d.expiry + gracePeriod;
     }
 
+    // ─── CORE REGISTER (onlyRole) ────────────────────────────────────
     function register(
         string calldata label,
         address owner,
@@ -65,11 +95,60 @@ contract GraphiteDNSRegistry is ERC721, AccessControl, Pausable, ReentrancyGuard
         address resolver,
         bytes32 parent
     )
-        external onlyRole(REGISTRAR_ROLE) whenNotPaused nonReentrant
+        external
+        onlyRole(REGISTRAR_ROLE)
+        whenNotPaused
+        nonReentrant
         returns (bytes32)
     {
         bytes32 node = _makeNode(parent, label);
-        require(isAvailable(node), "Taken or in grace");
+        return _registerDomain(node, label, owner, duration, resolver, parent);
+    }
+
+    // ─── FIXED-PRICE API ─────────────────────────────────────────────
+    /// @notice Admin sets a one-time price for a top-level name
+    function setFixedPrice(
+        string calldata label,
+        uint256 price
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _fixedPrice[_makeNode(0, label)] = price;
+    }
+
+    /// @notice Frontend calls this to display “Cost to register”
+    function priceOf(string calldata label) public view returns (uint256) {
+        bytes32 node = _makeNode(0, label);
+        uint256 p = _fixedPrice[node];
+        if (p != 0) {
+            return p;
+        }
+        // fallback: shorter names cost more
+        uint256 len = bytes(label).length;
+        return baseFee * (MAX_NAME_LENGTH - len + 1);
+    }
+
+    /// @notice Users call this to buy a top-level name at the on-chain price
+    function buyFixedPrice(
+        string calldata label,
+        address resolver,
+        uint64 duration
+    ) external payable whenNotPaused nonReentrant returns (bytes32) {
+        bytes32 node = _makeNode(0, label);
+        require(isAvailable(node), "Taken");
+        uint256 cost = priceOf(label);
+        require(msg.value >= cost, "Insufficient ETH");
+        return _registerDomain(node, label, msg.sender, duration, resolver, 0);
+    }
+
+    // ─── INTERNAL MINT HELPER ────────────────────────────────────────
+    function _registerDomain(
+        bytes32 node,
+        string calldata label,
+        address owner,
+        uint64 duration,
+        address resolver,
+        bytes32 parent
+    ) internal returns (bytes32) {
+        require(isAvailable(node), "Not available");
         require(duration <= maxRegistration, "Duration too long");
 
         _domains[node] = Domain({
@@ -85,26 +164,13 @@ contract GraphiteDNSRegistry is ERC721, AccessControl, Pausable, ReentrancyGuard
         _safeMint(owner, tid);
 
         emit DomainRegistered(node, label, owner, _domains[node].expiry);
-        if (resolver != address(0)) emit ResolverUpdated(node, resolver);
+        if (resolver != address(0)) {
+            emit ResolverUpdated(node, resolver);
+        }
         return node;
     }
 
-    function extend(bytes32 node, uint64 extra) external onlyRole(REGISTRAR_ROLE) {
-        Domain storage d = _domains[node];
-        require(block.timestamp <= d.expiry, "Expired");
-        d.expiry += extra;
-    }
-
-    function reclaim(bytes32 node) external onlyRole(REGISTRAR_ROLE) {
-        Domain storage d = _domains[node];
-        require(block.timestamp > d.expiry + gracePeriod, "In grace");
-        uint256 tid = uint256(node) % nextId;
-        _burn(tid);
-        delete _domains[node];
-        delete _labels[node];
-        delete _nodeOfLabel[_labels[node]];
-    }
-
+    // ─── EIP-712 TRANSFER ─────────────────────────────────────────────
     function transferWithSig(
         bytes32 node,
         address from,
@@ -113,36 +179,28 @@ contract GraphiteDNSRegistry is ERC721, AccessControl, Pausable, ReentrancyGuard
         uint256 deadline,
         bytes calldata sig
     ) external whenNotPaused nonReentrant {
-        require(block.timestamp <= deadline, "Expired sig");
-        require(!_usedNonces[from][nonce], "Nonce used");
-        Domain storage d = _domains[node];
-        require(d.owner == from, "Not owner");
+        require(block.timestamp <= deadline, "Sig expired");
 
         bytes32 structHash = keccak256(
             abi.encode(_TRANSFER_TYPEHASH, node, from, to, nonce, deadline)
         );
-        bytes32 hash = _hashTypedDataV4(structHash);
-        require(hash.recover(sig) == from, "Bad sig");
-        _usedNonces[from][nonce] = true;
+        bytes32 digest = _hashTypedDataV4(structHash);
+        address signer = digest.recover(sig); // now visible
+        require(signer == from, "Bad signature");
+
+        Domain storage d = _domains[node];
+        require(d.owner == from, "Not owner");
+        d.owner = to;
 
         uint256 tid = uint256(node) % nextId;
-        d.owner = to;
         _transfer(from, to, tid);
         emit DomainTransferred(node, from, to);
     }
 
-    function setResolver(bytes32 node, address resolver)
-        external onlyRole(RESOLVER_ROLE)
-    {
-        Domain storage d = _domains[node];
-        require(block.timestamp <= d.expiry, "Expired");
-        d.resolver = resolver;
-        emit ResolverUpdated(node, resolver);
-    }
-
-    function supportsInterface(bytes4 iid)
-        public view override(ERC721, AccessControl) returns (bool)
-    {
+    // ─── SUPPORTS INTERFACE ───────────────────────────────────────────
+    function supportsInterface(
+        bytes4 iid
+    ) public view override(ERC721, AccessControl) returns (bool) {
         return super.supportsInterface(iid);
     }
 }
