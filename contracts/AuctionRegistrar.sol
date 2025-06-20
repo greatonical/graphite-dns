@@ -1,4 +1,3 @@
-// contracts/AuctionRegistrar.sol
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
@@ -7,6 +6,10 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 contract AuctionRegistrar is GraphiteDNSRegistry {
     using ECDSA for bytes32;
+
+    constructor(address resolverForTLD)
+        GraphiteDNSRegistry(resolverForTLD)
+    {}
 
     struct Auction {
         uint256 commitEnd;
@@ -25,7 +28,7 @@ contract AuctionRegistrar is GraphiteDNSRegistry {
         uint256 commitDuration,
         uint256 revealDuration
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        bytes32 node = _makeNode(0, label);
+        bytes32 node = _makeNode(TLD_NODE, label);
         Auction storage a = _auctions[node];
         require(a.commitEnd == 0, "Exists");
         a.commitEnd = block.timestamp + commitDuration;
@@ -33,7 +36,7 @@ contract AuctionRegistrar is GraphiteDNSRegistry {
     }
 
     function commitBid(string calldata label, bytes32 bidHash) external {
-        bytes32 node = _makeNode(0, label);
+        bytes32 node = _makeNode(TLD_NODE, label);
         Auction storage a = _auctions[node];
         require(block.timestamp <= a.commitEnd, "Commit closed");
         require(a.commitments[msg.sender] == bytes32(0), "Committed");
@@ -45,11 +48,17 @@ contract AuctionRegistrar is GraphiteDNSRegistry {
         uint256 bid,
         bytes32 salt
     ) external payable {
-        bytes32 node = _makeNode(0, label);
+        bytes32 node = _makeNode(TLD_NODE, label);
         Auction storage a = _auctions[node];
-        require(block.timestamp > a.commitEnd && block.timestamp <= a.revealEnd, "No reveal");
-        require(a.commitments[msg.sender] == keccak256(abi.encodePacked(bid, salt)), "Bad reveal");
-        require(msg.value == bid, "Bad deposit");
+        require(
+            block.timestamp > a.commitEnd && block.timestamp <= a.revealEnd,
+            "No reveal"
+        );
+        require(
+            a.commitments[msg.sender] == keccak256(abi.encodePacked(bid, salt)),
+            "Bad reveal"
+        );
+        require(msg.value == bid, "Wrong deposit");
         a.deposits[msg.sender] = bid;
 
         if (bid > a.highestBid) {
@@ -63,23 +72,20 @@ contract AuctionRegistrar is GraphiteDNSRegistry {
         }
     }
 
-    function finalizeAuction(string calldata label, address owner, uint64 duration, address resolver, bytes32 parent)
-        external nonReentrant
-    {
+    function finalizeAuction(
+        string calldata label,
+        address owner,
+        uint64 duration,
+        address resolver,
+        bytes32 parent
+    ) external nonReentrant {
         bytes32 node = _makeNode(parent, label);
         Auction storage a = _auctions[node];
-        require(block.timestamp > a.revealEnd, "Auction open");
-        require(!a.finalized, "Finalized");
+        require(block.timestamp > a.revealEnd, "Open");
+        require(!a.finalized, "Done");
         require(msg.sender == a.highestBidder, "Not winner");
         a.finalized = true;
-        _domains[node].owner = owner;
-        _domains[node].resolver = resolver;
-        _domains[node].expiry = uint64(block.timestamp + duration);
-        _labels[node] = label;
-        _nodeOfLabel[label] = node;
 
-        uint256 tid = nextId++;
-        _safeMint(owner, tid);
-        emit DomainRegistered(node, label, owner, _domains[node].expiry);
+        _registerDomain(node, label, owner, duration, resolver, parent);
     }
 }
