@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { ethers, network } from "hardhat";
+import { ethers, artifacts, network } from "hardhat";
 import type { AuctionRegistrar, GraphiteResolver } from "../typechain";
 
 describe("AuctionRegistrar", function () {
@@ -13,17 +13,15 @@ describe("AuctionRegistrar", function () {
   beforeEach(async () => {
     [owner, bidder1, bidder2] = await ethers.getSigners();
 
-    resolver = (await ethers.deployContract(
-      "GraphiteResolver",
-      [],
-      owner
-    )) as GraphiteResolver;
+    const resArt = await artifacts.readArtifact("GraphiteResolver");
+    const resFactory = new ethers.ContractFactory(resArt.abi, resArt.bytecode, owner);
+    resolver = (await resFactory.deploy()) as GraphiteResolver;
+    await resolver.waitForDeployment();
 
-    auction = (await ethers.deployContract(
-      "AuctionRegistrar",
-      [resolver.target],
-      owner
-    )) as AuctionRegistrar;
+    const aucArt = await artifacts.readArtifact("AuctionRegistrar");
+    const aucFactory = new ethers.ContractFactory(aucArt.abi, aucArt.bytecode, owner);
+    auction = (await aucFactory.deploy(resolver.target)) as AuctionRegistrar;
+    await auction.waitForDeployment();
   });
 
   it("runs a blind auction and mints to the winner", async () => {
@@ -33,10 +31,7 @@ describe("AuctionRegistrar", function () {
     await auction.startAuction(label, 1, 1);
 
     const bidHash = ethers.keccak256(
-      new ethers.AbiCoder().encode(
-        ["uint256", "bytes32"],
-        [bidAmount, salt]
-      )
+      new ethers.AbiCoder().encode(["uint256","bytes32"], [bidAmount, salt])
     );
     await auction.connect(bidder1).commitBid(label, bidHash);
 
