@@ -126,6 +126,10 @@ contract GraphiteDNSRegistry is
         _fixedPrice[_makeNode(TLD_NODE, label)] = price;
     }
 
+    function getDomain(bytes32 node) public view returns (Domain memory) {
+        return _domains[node];
+    }
+
     function priceOf(string calldata label) public view returns (uint256) {
         bytes32 node = _makeNode(TLD_NODE, label);
         uint256 p = _fixedPrice[node];

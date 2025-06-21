@@ -3,6 +3,7 @@ import "@nomicfoundation/hardhat-toolbox";
 import "hardhat-gas-reporter";
 import "hardhat-contract-sizer";
 import "solidity-coverage";
+import "@typechain/hardhat";
 
 import * as dotenv from "dotenv";
 dotenv.config();
@@ -23,8 +24,20 @@ const config: HardhatUserConfig = {
 
   networks: {
     hardhat: {
+      // forking: {
+      //   url: process.env.GRAPHITE_MAINNET_RPC_URL!,
+      //   blockNumber: process.env.FORK_BLOCK_NUMBER
+      //     ? Number(process.env.FORK_BLOCK_NUMBER)
+      //     : undefined,
+      // },
+    },
+
+        // an explicit forked network, only if you need it:
+    forked: {
+      url: process.env.GRAPHITE_TESTNET_RPC_URL!,
+      chainId: 440017,
       forking: {
-        url: process.env.GRAPHITE_MAINNET_RPC_URL!,
+        url: process.env.GRAPHITE_TESTNET_RPC_URL!,
         blockNumber: process.env.FORK_BLOCK_NUMBER
           ? Number(process.env.FORK_BLOCK_NUMBER)
           : undefined,
@@ -73,7 +86,7 @@ const config: HardhatUserConfig = {
 
   typechain: {
     outDir: "typechain",
-    target: "ethers-v5",
+    target: "ethers-v6",
   },
 
   paths: {

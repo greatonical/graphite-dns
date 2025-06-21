@@ -2,40 +2,40 @@ import { ethers } from "hardhat";
 
 async function main() {
   const [deployer] = await ethers.getSigners();
+  console.log("Deploying with", deployer.address);
 
-  // 1) Deploy resolver
-  const Resolver = await ethers.getContractFactory("GraphiteResolver");
-  const resolver = await Resolver.deploy();
-  await resolver.deployed();
+  // 1) GraphiteResolver
+  const ResolverFactory = await ethers.getContractFactory("GraphiteResolver");
+  const resolver = await ResolverFactory.deploy();
+  await resolver.waitForDeployment();
+  console.log("GraphiteResolver ➡", resolver.target);
 
-  // 2) Deploy core registry with resolverForTLD
-  const Registry = await ethers.getContractFactory("GraphiteDNSRegistry");
-  const registry = await Registry.deploy(resolver.address);
-  await registry.deployed();
+  // 2) GraphiteDNSRegistry
+  const RegistryFactory = await ethers.getContractFactory("GraphiteDNSRegistry");
+  const registry = await RegistryFactory.deploy(resolver.target);
+  await registry.waitForDeployment();
+  console.log("GraphiteDNSRegistry ➡", registry.target);
 
-  // 3) Deploy AuctionRegistrar
-  const Auction = await ethers.getContractFactory("AuctionRegistrar");
-  const auction = await Auction.deploy(resolver.address);
-  await auction.deployed();
+  // 3) AuctionRegistrar
+  const AuctionFactory = await ethers.getContractFactory("AuctionRegistrar");
+  const auction = await AuctionFactory.deploy(resolver.target);
+  await auction.waitForDeployment();
+  console.log("AuctionRegistrar ➡", auction.target);
 
-  // 4) Deploy SubdomainRegistrar
-  const Subdomain = await ethers.getContractFactory("SubdomainRegistrar");
-  const subdomain = await Subdomain.deploy(resolver.address);
-  await subdomain.deployed();
+  // 4) SubdomainRegistrar
+  const SubFactory = await ethers.getContractFactory("SubdomainRegistrar");
+  const subdomain = await SubFactory.deploy(resolver.target);
+  await subdomain.waitForDeployment();
+  console.log("SubdomainRegistrar ➡", subdomain.target);
 
-  // 5) Deploy ReverseRegistrar
-  const Reverse = await ethers.getContractFactory("ReverseRegistrar");
-  const reverse = await Reverse.deploy();
-  await reverse.deployed();
-
-  console.log("GraphiteResolver:      ", resolver.address);
-  console.log("GraphiteDNSRegistry:   ", registry.address);
-  console.log("AuctionRegistrar:      ", auction.address);
-  console.log("SubdomainRegistrar:    ", subdomain.address);
-  console.log("ReverseRegistrar:      ", reverse.address);
+  // 5) ReverseRegistrar
+  const ReverseFactory = await ethers.getContractFactory("ReverseRegistrar");
+  const reverse = await ReverseFactory.deploy();
+  await reverse.waitForDeployment();
+  console.log("ReverseRegistrar ➡", reverse.target);
 }
 
-main().catch(e => {
+main().catch((e) => {
   console.error(e);
   process.exit(1);
 });
