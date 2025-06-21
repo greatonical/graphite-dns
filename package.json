@@ -11,7 +11,6 @@
   "description": "",
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
-    "@typechain/ethers-v6": "^0.5.1",
     "@typechain/hardhat": "^9.1.0",
     "@types/chai": "^4.3.20",
     "@types/node": "^24.0.3",
@@ -27,6 +26,7 @@
   "dependencies": {
     "@openzeppelin/contracts": "^5.3.0",
     "@pinata/sdk": "^2.1.0",
+    "@typechain/ethers-v6": "^0.5.1",
     "dotenv": "^16.5.0",
     "ethers": "^6.14.4",
     "ipfs-http-client": "^60.0.1"

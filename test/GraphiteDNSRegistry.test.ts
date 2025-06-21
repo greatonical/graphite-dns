@@ -11,16 +11,16 @@ describe("GraphiteDNSRegistry", function () {
   beforeEach(async () => {
     [owner, addr1, addr2] = await ethers.getSigners();
 
-    // deploy GraphiteResolver
-    const resArt = await artifacts.readArtifact("GraphiteResolver");
+    // Deploy the resolver
+    const resArt     = await artifacts.readArtifact("GraphiteResolver");
     const resFactory = new ethers.ContractFactory(resArt.abi, resArt.bytecode, owner);
-    resolver = (await resFactory.deploy()) as GraphiteResolver;
+    resolver         = (await resFactory.deploy()) as GraphiteResolver;
     await resolver.waitForDeployment();
 
-    // deploy GraphiteDNSRegistry
-    const regArt = await artifacts.readArtifact("GraphiteDNSRegistry");
+    // Deploy the registry
+    const regArt     = await artifacts.readArtifact("GraphiteDNSRegistry");
     const regFactory = new ethers.ContractFactory(regArt.abi, regArt.bytecode, owner);
-    registry = (await regFactory.deploy(resolver.target)) as GraphiteDNSRegistry;
+    registry         = (await regFactory.deploy(resolver.target)) as GraphiteDNSRegistry;
     await registry.waitForDeployment();
   });
 
@@ -30,17 +30,20 @@ describe("GraphiteDNSRegistry", function () {
   });
 
   it("allows registrar to register a name", async () => {
-    const tx = await registry.register(
-      "alice",
-      owner.address,
-      oneYear,
-      ethers.ZeroAddress,
-      ethers.ZeroHash
-    );
-    const receipt: any = await tx.wait();
-    expect(receipt.events?.some((e: any) => e.event === "DomainRegistered")).to.be.true;
+    await expect(
+      registry.register(
+        "alice",
+        owner.address,
+        oneYear,
+        ethers.ZeroAddress,
+        ethers.ZeroHash
+      )
+    ).to.emit(registry, "DomainRegistered");
+
+    // Token minted is ID 1
     expect(await registry.ownerOf(1)).to.equal(owner.address);
 
+    // priceOf fallback works
     const price = await registry.priceOf("alice");
     expect(typeof price).to.equal("bigint");
   });
@@ -49,6 +52,7 @@ describe("GraphiteDNSRegistry", function () {
     await expect(
       registry.connect(addr1).setFixedPrice("bob", ethers.parseEther("1.0"))
     ).to.be.reverted;
+
     await registry.setFixedPrice("bob", ethers.parseEther("1.0"));
     expect(await registry.priceOf("bob")).to.equal(ethers.parseEther("1.0"));
   });
@@ -58,10 +62,20 @@ describe("GraphiteDNSRegistry", function () {
     const price = await registry.priceOf("charlie");
 
     await expect(
-      registry.connect(addr1).buyFixedPrice("charlie", ethers.ZeroAddress, oneYear, { value: price - 1n })
+      registry.connect(addr1).buyFixedPrice(
+        "charlie",
+        ethers.ZeroAddress,
+        oneYear,
+        { value: price - 1n }
+      )
     ).to.be.revertedWith("Insufficient ETH");
 
-    await registry.connect(addr1).buyFixedPrice("charlie", ethers.ZeroAddress, oneYear, { value: price });
+    await registry.connect(addr1).buyFixedPrice(
+      "charlie",
+      ethers.ZeroAddress,
+      oneYear,
+      { value: price }
+    );
     expect(await registry.ownerOf(2)).to.equal(addr1.address);
   });
 });

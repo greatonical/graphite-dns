@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { ethers } from "hardhat";
+import { ethers, artifacts } from "hardhat";
 import type { ReverseRegistrar } from "../typechain";
 
 describe("ReverseRegistrar", function () {
@@ -10,11 +10,10 @@ describe("ReverseRegistrar", function () {
   beforeEach(async () => {
     [owner, other] = await ethers.getSigners();
 
-    reverse = (await ethers.deployContract(
-      "ReverseRegistrar",
-      [],
-      owner
-    )) as ReverseRegistrar;
+    const art     = await artifacts.readArtifact("ReverseRegistrar");
+    const factory = new ethers.ContractFactory(art.abi, art.bytecode, owner);
+    reverse       = (await factory.deploy()) as ReverseRegistrar;
+    await reverse.waitForDeployment();
   });
 
   it("allows only REVERSE_ROLE to set reverse and anyone to get", async () => {
