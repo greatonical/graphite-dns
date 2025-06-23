@@ -3,7 +3,13 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "compile": "npx hardhat compile",
+    "test": "npx hardhat test",
+    "gas-report": "REPORT_GAS=true npx hardhat test",
+    "coverage": "npx hardhat coverage",
+    "size": "npx hardhat contract-sizer",
+    "deploy:graphiteTestnet": "npx hardhat run scripts/deploy.ts --network graphiteTestnet",
+    "deploy:graphite": "npx hardhat run scripts/deploy.ts --network graphite"
   },
   "keywords": [],
   "author": "",

@@ -7,7 +7,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract AuctionRegistrar is AccessControl, ReentrancyGuard {
     GraphiteDNSRegistry public immutable registry;
-    bytes32             public immutable TLD_NODE;
+    bytes32 public immutable TLD_NODE;
 
     struct Auction {
         uint256 commitEnd;
@@ -21,10 +21,26 @@ contract AuctionRegistrar is AccessControl, ReentrancyGuard {
 
     mapping(bytes32 => Auction) private auctions;
 
-    event AuctionStarted(bytes32 indexed node, uint256 commitEnd, uint256 revealEnd);
-    event BidCommitted (bytes32 indexed node, address indexed bidder, bytes32 hash);
-    event BidRevealed  (bytes32 indexed node, address indexed bidder, uint256 amount);
-    event AuctionFinalized(bytes32 indexed node, address indexed winner, uint256 amount);
+    event AuctionStarted(
+        bytes32 indexed node,
+        uint256 commitEnd,
+        uint256 revealEnd
+    );
+    event BidCommitted(
+        bytes32 indexed node,
+        address indexed bidder,
+        bytes32 hash
+    );
+    event BidRevealed(
+        bytes32 indexed node,
+        address indexed bidder,
+        uint256 amount
+    );
+    event AuctionFinalized(
+        bytes32 indexed node,
+        address indexed winner,
+        uint256 amount
+    );
 
     constructor(address registryAddress) {
         registry = GraphiteDNSRegistry(registryAddress);
@@ -37,7 +53,9 @@ contract AuctionRegistrar is AccessControl, ReentrancyGuard {
         uint256 commitDuration,
         uint256 revealDuration
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        bytes32 node = keccak256(abi.encodePacked(TLD_NODE, keccak256(bytes(label))));
+        bytes32 node = keccak256(
+            abi.encodePacked(TLD_NODE, keccak256(bytes(label)))
+        );
         Auction storage a = auctions[node];
         require(a.commitEnd == 0, "Exists");
         a.commitEnd = block.timestamp + commitDuration;
@@ -46,7 +64,9 @@ contract AuctionRegistrar is AccessControl, ReentrancyGuard {
     }
 
     function commitBid(string calldata label, bytes32 hash) external {
-        bytes32 node = keccak256(abi.encodePacked(TLD_NODE, keccak256(bytes(label))));
+        bytes32 node = keccak256(
+            abi.encodePacked(TLD_NODE, keccak256(bytes(label)))
+        );
         Auction storage a = auctions[node];
         require(block.timestamp <= a.commitEnd, "Commit closed");
         require(a.commitments[msg.sender] == bytes32(0), "Already committed");
@@ -59,14 +79,16 @@ contract AuctionRegistrar is AccessControl, ReentrancyGuard {
         uint256 bid,
         bytes32 salt
     ) external payable {
-        bytes32 node = keccak256(abi.encodePacked(TLD_NODE, keccak256(bytes(label))));
+        bytes32 node = keccak256(
+            abi.encodePacked(TLD_NODE, keccak256(bytes(label)))
+        );
         Auction storage a = auctions[node];
 
         // ← widened here: allow reveal at t == commitEnd
         // require(block.timestamp >= a.commitEnd,    "No reveal");
         // require(block.timestamp <= a.revealEnd,    "Reveal over");
-        require(block.timestamp >= a.commitEnd,    "No reveal");
-        require(msg.value == bid,                  "Wrong deposit");
+        require(block.timestamp >= a.commitEnd, "No reveal");
+        require(msg.value == bid, "Wrong deposit");
         require(
             a.commitments[msg.sender] == keccak256(abi.encodePacked(bid, salt)),
             "Bad reveal"
@@ -78,7 +100,7 @@ contract AuctionRegistrar is AccessControl, ReentrancyGuard {
                 payable(a.highestBidder).transfer(a.highestBid);
             }
             a.highestBidder = msg.sender;
-            a.highestBid    = bid;
+            a.highestBid = bid;
         } else {
             payable(msg.sender).transfer(bid);
         }
@@ -89,20 +111,22 @@ contract AuctionRegistrar is AccessControl, ReentrancyGuard {
     function finalizeAuction(
         string calldata label,
         address owner_,
-        uint64  duration,
+        uint64 duration,
         address resolver_,
         bytes32 parent
     ) external nonReentrant {
-        bytes32 node = keccak256(abi.encodePacked(parent, keccak256(bytes(label))));
+        bytes32 node = keccak256(
+            abi.encodePacked(parent, keccak256(bytes(label)))
+        );
         Auction storage a = auctions[node];
 
-        require(block.timestamp >  a.revealEnd,   "Auction open");
-        require(!a.finalized,                     "Already done");
-        require(msg.sender == a.highestBidder,    "Not winner");
+        require(block.timestamp > a.revealEnd, "Auction open");
+        require(!a.finalized, "Already done");
+        require(msg.sender == a.highestBidder, "Not winner");
 
         a.finalized = true;
 
-        registry.register{ value: a.highestBid }(
+        registry.register{value: a.highestBid}(
             label,
             owner_,
             duration,

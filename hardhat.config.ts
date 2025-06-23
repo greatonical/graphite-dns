@@ -60,7 +60,7 @@ const config: HardhatUserConfig = {
   etherscan: {
     apiKey: {
       graphite: process.env.GRAPITHESCAN_API_KEY || "",
-      graphiteTestnet: process.env.GRAPITHESCAN_API_KEY || "",
+      graphiteTestnet: process.env.GRAPITHESCAN_TESTNET_API_KEY || "",
     },
     customChains: [
       {

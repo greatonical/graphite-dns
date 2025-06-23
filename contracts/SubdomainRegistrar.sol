@@ -9,31 +9,32 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract SubdomainRegistrar is AccessControl, Pausable, ReentrancyGuard {
     GraphiteDNSRegistry public immutable registry;
-    bytes32             public immutable TLD_NODE;
+    bytes32 public immutable TLD_NODE;
 
     mapping(bytes32 => mapping(string => uint256)) private _prices;
 
     event SubdomainPriceSet(
         bytes32 indexed parent,
-        string   label,
-        uint256  price
+        string label,
+        uint256 price
     );
     event SubdomainRegistered(
         bytes32 indexed node,
-        string   label,
-        address  owner,
-        uint64   expiry
+        string label,
+        address owner,
+        uint64 expiry
     );
 
     constructor(address registryAddress) {
-        registry   = GraphiteDNSRegistry(registryAddress);
-        TLD_NODE   = registry.TLD_NODE();
+        registry = GraphiteDNSRegistry(registryAddress);
+        TLD_NODE = registry.TLD_NODE();
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
 
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _pause();
     }
+
     function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _unpause();
     }
@@ -42,10 +43,7 @@ contract SubdomainRegistrar is AccessControl, Pausable, ReentrancyGuard {
         bytes32 parentNode,
         string calldata label,
         uint256 price
-    )
-        external
-        whenNotPaused
-    {
+    ) external whenNotPaused {
         // only the owner of that parent node may set prices
         require(
             registry.getDomain(parentNode).owner == msg.sender,
@@ -55,11 +53,10 @@ contract SubdomainRegistrar is AccessControl, Pausable, ReentrancyGuard {
         emit SubdomainPriceSet(parentNode, label, price);
     }
 
-    function priceOfSubdomain(bytes32 parentNode, string calldata label)
-        external
-        view
-        returns (uint256)
-    {
+    function priceOfSubdomain(
+        bytes32 parentNode,
+        string calldata label
+    ) external view returns (uint256) {
         uint256 p = _prices[parentNode][label];
         require(p > 0, "Price not set");
         return p;
@@ -70,13 +67,7 @@ contract SubdomainRegistrar is AccessControl, Pausable, ReentrancyGuard {
         string calldata label,
         address resolver_,
         uint64 duration
-    )
-        external
-        payable
-        whenNotPaused
-        nonReentrant
-        returns (bytes32)
-    {
+    ) external payable whenNotPaused nonReentrant returns (bytes32) {
         uint256 price = _prices[parentNode][label];
         require(price > 0, "Price not set");
         require(msg.value >= price, "Insufficient ETH");
@@ -100,12 +91,9 @@ contract SubdomainRegistrar is AccessControl, Pausable, ReentrancyGuard {
         return node;
     }
 
-    function supportsInterface(bytes4 interfaceId)
-        public
-        view
-        override(AccessControl)
-        returns (bool)
-    {
+    function supportsInterface(
+        bytes4 interfaceId
+    ) public view override(AccessControl) returns (bool) {
         return super.supportsInterface(interfaceId);
     }
 }

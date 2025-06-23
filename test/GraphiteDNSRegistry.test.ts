@@ -12,15 +12,25 @@ describe("GraphiteDNSRegistry", function () {
     [owner, addr1, addr2] = await ethers.getSigners();
 
     // Deploy the resolver
-    const resArt     = await artifacts.readArtifact("GraphiteResolver");
-    const resFactory = new ethers.ContractFactory(resArt.abi, resArt.bytecode, owner);
-    resolver         = (await resFactory.deploy()) as GraphiteResolver;
+    const resArt = await artifacts.readArtifact("GraphiteResolver");
+    const resFactory = new ethers.ContractFactory(
+      resArt.abi,
+      resArt.bytecode,
+      owner
+    );
+    resolver = (await resFactory.deploy()) as GraphiteResolver;
     await resolver.waitForDeployment();
 
     // Deploy the registry
-    const regArt     = await artifacts.readArtifact("GraphiteDNSRegistry");
-    const regFactory = new ethers.ContractFactory(regArt.abi, regArt.bytecode, owner);
-    registry         = (await regFactory.deploy(resolver.target)) as GraphiteDNSRegistry;
+    const regArt = await artifacts.readArtifact("GraphiteDNSRegistry");
+    const regFactory = new ethers.ContractFactory(
+      regArt.abi,
+      regArt.bytecode,
+      owner
+    );
+    registry = (await regFactory.deploy(
+      resolver.target
+    )) as GraphiteDNSRegistry;
     await registry.waitForDeployment();
   });
 
@@ -62,20 +72,16 @@ describe("GraphiteDNSRegistry", function () {
     const price = await registry.priceOf("charlie");
 
     await expect(
-      registry.connect(addr1).buyFixedPrice(
-        "charlie",
-        ethers.ZeroAddress,
-        oneYear,
-        { value: price - 1n }
-      )
+      registry
+        .connect(addr1)
+        .buyFixedPrice("charlie", ethers.ZeroAddress, oneYear, {
+          value: price - 1n,
+        })
     ).to.be.revertedWith("Insufficient ETH");
 
-    await registry.connect(addr1).buyFixedPrice(
-      "charlie",
-      ethers.ZeroAddress,
-      oneYear,
-      { value: price }
-    );
+    await registry
+      .connect(addr1)
+      .buyFixedPrice("charlie", ethers.ZeroAddress, oneYear, { value: price });
     expect(await registry.ownerOf(2)).to.equal(addr1.address);
   });
 });
