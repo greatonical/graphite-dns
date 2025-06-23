@@ -250,4 +250,4 @@ await regWrite.buyFixedPrice("alice", resolverAddr, duration, { value: price });
 
 ## License
 
-MIT © Your Organization
+MIT © Graphite Network
