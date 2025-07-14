@@ -35,10 +35,18 @@ contract GraphiteDNSRegistry is
         bytes32 parent;
     }
 
+    // Core mappings
     mapping(bytes32 => Domain) internal _domains;
     mapping(bytes32 => string) internal _labels;
     mapping(string => bytes32) internal _nodeOfLabel;
     mapping(bytes32 => uint256) private _fixedPrice;
+    
+    // NEW: NFT tokenId to node mapping
+    mapping(uint256 => bytes32) private _tokenToNode;
+    mapping(bytes32 => uint256) private _nodeToToken;
+    
+    // NEW: Duration-based pricing tiers
+    mapping(uint256 => uint256) public durationMultipliers; // duration in years => multiplier (basis points)
 
     bytes32 private constant _TRANSFER_TYPEHASH =
         keccak256(
@@ -57,64 +65,122 @@ contract GraphiteDNSRegistry is
         address indexed buyer,
         uint256 cost
     );
-    event DomainTransferred(bytes32 indexed node, address from, address to);
+    event DomainTransferred(
+        bytes32 indexed node,
+        address indexed from,
+        address indexed to
+    );
 
-    constructor(
-        address resolverForTLD
-    ) ERC721("Graphite DNS", "GDNS") EIP712("GraphiteDNS", "1.0.0") {
+    constructor(address defaultResolver) ERC721("Graphite DNS", "GDNS") EIP712("GraphiteDNS", "1") {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(REGISTRAR_ROLE, msg.sender);
         _grantRole(PAUSER_ROLE, msg.sender);
         _grantRole(RESOLVER_ROLE, msg.sender);
 
-        // bootstrap the ".atgraphite" TLD
-        bytes32 root = _makeNode(bytes32(0), "atgraphite");
-        TLD_NODE = root;
-        _registerDomain(
-            root,
-            "atgraphite",
-            msg.sender,
-            uint64(maxRegistration),
-            resolverForTLD,
+        TLD_NODE = keccak256(abi.encodePacked(bytes32(0), keccak256("atgraphite")));
+        
+        // Initialize duration multipliers (10000 = 100%, no discount/premium)
+        durationMultipliers[1] = 10000;  // 1 year: base price
+        durationMultipliers[2] = 9500;   // 2 years: 5% discount  
+        durationMultipliers[3] = 9000;   // 3 years: 10% discount
+        durationMultipliers[5] = 8500;   // 5 years: 15% discount
+        durationMultipliers[10] = 8000;  // 10 years: 20% discount
+
+        // Bootstrap .atgraphite TLD with max uint64 expiry
+        _domains[TLD_NODE] = Domain(
+            address(this),
+            defaultResolver,
+            type(uint64).max, // Use uint64 max, not uint256 max
             bytes32(0)
         );
+        _labels[TLD_NODE] = "atgraphite";
     }
 
-    function pause() external onlyRole(PAUSER_ROLE) {
-        _pause();
+    // ===== PRICING FUNCTIONS =====
+    
+    /// @notice Set duration-based pricing multiplier
+    function setDurationMultiplier(uint256 durationYears, uint256 multiplier) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(multiplier > 0 && multiplier <= 20000, "Invalid multiplier"); // max 200%
+        durationMultipliers[durationYears] = multiplier;
     }
 
-    function unpause() external onlyRole(PAUSER_ROLE) {
-        _unpause();
+    /// @notice Calculate price including duration
+    function priceOf(string calldata label, uint64 duration) public view returns (uint256) {
+        bytes32 node = _makeNode(TLD_NODE, label);
+        uint256 basePrice = _fixedPrice[node];
+        
+        if (basePrice == 0) {
+            uint256 len = bytes(label).length;
+            basePrice = baseFee * (MAX_NAME_LENGTH - len + 1);
+        }
+        
+        return _applyDurationPricing(basePrice, duration);
     }
 
-    function _makeNode(
-        bytes32 parent,
-        string memory label
-    ) internal pure returns (bytes32) {
+    /// @notice Legacy priceOf for 1-year duration (backward compatibility)
+    function priceOf(string calldata label) public view returns (uint256) {
+        return priceOf(label, uint64(365 days));
+    }
+
+    function _applyDurationPricing(uint256 basePrice, uint64 duration) internal view returns (uint256) {
+        uint256 durationYears = duration / 365 days;
+        if (durationYears == 0) durationYears = 1; // Minimum 1 year pricing
+        
+        uint256 multiplier = durationMultipliers[durationYears];
+        if (multiplier == 0) {
+            // No specific multiplier, use linear pricing for year
+            multiplier = 10000;
+        }
+        
+        // Calculate: basePrice * years * multiplier / 10000
+        return (basePrice * durationYears * multiplier) / 10000;
+    }
+
+    // ===== DOMAIN MANAGEMENT =====
+
+    function _makeNode(bytes32 parent, string memory label) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked(parent, keccak256(bytes(label))));
     }
 
     function _validateLabel(string memory label) internal pure {
         bytes memory b = bytes(label);
-        require(
-            b.length > 0 && b.length <= MAX_NAME_LENGTH,
-            "Invalid label length"
-        );
+        require(b.length > 0 && b.length <= MAX_NAME_LENGTH, "Invalid length");
+        
+        for (uint i = 0; i < b.length; i++) {
+            bytes1 char = b[i];
+            require(
+                (char >= 0x30 && char <= 0x39) || // 0-9
+                (char >= 0x61 && char <= 0x7A) || // a-z
+                char == 0x2D, // hyphen
+                "Invalid character"
+            );
+        }
+        
+        require(b[0] != 0x2D && b[b.length - 1] != 0x2D, "Cannot start/end with hyphen");
     }
 
     function isAvailable(bytes32 node) public view returns (bool) {
-        Domain storage d = _domains[node];
-        return
-            d.owner == address(0) || block.timestamp > d.expiry + gracePeriod;
+        Domain storage domain = _domains[node];
+        return domain.expiry == 0 || 
+               (domain.expiry < block.timestamp && 
+                block.timestamp > domain.expiry + gracePeriod);
     }
 
-    /// @notice Read the full domain record
     function getDomain(bytes32 node) external view returns (Domain memory) {
         return _domains[node];
     }
 
-    /// @notice Core registrar entrypoint (for registrar modules)
+    function getNodeOfLabel(string calldata label) external view returns (bytes32) {
+        return _nodeOfLabel[label];
+    }
+
+    function getLabelOfNode(bytes32 node) external view returns (string memory) {
+        return _labels[node];
+    }
+
+    // ===== REGISTRATION FUNCTIONS =====
+
+    /// @notice Register domain with duration-based pricing
     function register(
         string calldata label,
         address owner_,
@@ -131,31 +197,10 @@ contract GraphiteDNSRegistry is
     {
         _validateLabel(label);
         bytes32 node = _makeNode(parent, label);
-        return
-            _registerDomain(node, label, owner_, duration, resolver_, parent);
+        return _registerDomain(node, label, owner_, duration, resolver_, parent);
     }
 
-    /// @notice Admin sets a one-time price for a TLD name
-    function setFixedPrice(
-        string calldata label,
-        uint256 price
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        bytes32 node = _makeNode(TLD_NODE, label);
-        _fixedPrice[node] = price;
-    }
-
-    /// @notice Frontend calls to display cost
-    function priceOf(string calldata label) public view returns (uint256) {
-        bytes32 node = _makeNode(TLD_NODE, label);
-        uint256 p = _fixedPrice[node];
-        if (p != 0) {
-            return p;
-        }
-        uint256 len = bytes(label).length;
-        return baseFee * (MAX_NAME_LENGTH - len + 1);
-    }
-
-    /// @notice Buy a TLD name at on-chain fixed price
+    /// @notice Buy a TLD name with duration-based pricing
     function buyFixedPrice(
         string calldata label,
         address resolver_,
@@ -163,12 +208,12 @@ contract GraphiteDNSRegistry is
     ) external payable whenNotPaused nonReentrant returns (bytes32) {
         _validateLabel(label);
         bytes32 node = _makeNode(TLD_NODE, label);
-        require(isAvailable(node), "Taken");
+        require(isAvailable(node), "Domain not available");
 
-        uint256 cost = priceOf(label);
-        require(msg.value >= cost, "Insufficient ETH");
+        uint256 cost = priceOf(label, duration);
+        require(msg.value >= cost, "Insufficient payment");
 
-        // refund any overpayment
+        // Refund overpayment
         if (msg.value > cost) {
             payable(msg.sender).transfer(msg.value - cost);
         }
@@ -181,6 +226,7 @@ contract GraphiteDNSRegistry is
             resolver_,
             TLD_NODE
         );
+        
         emit NamePurchased(node, msg.sender, cost);
         return created;
     }
@@ -193,7 +239,7 @@ contract GraphiteDNSRegistry is
         address resolver_,
         bytes32 parent
     ) internal returns (bytes32) {
-        require(isAvailable(node), "Not available");
+        require(isAvailable(node), "Domain not available");
         require(duration <= maxRegistration, "Duration too long");
 
         uint64 expiry = uint64(block.timestamp + duration);
@@ -201,7 +247,10 @@ contract GraphiteDNSRegistry is
         _labels[node] = label;
         _nodeOfLabel[label] = node;
 
+        // Mint NFT and link to node
         uint256 tokenId = nextId++;
+        _tokenToNode[tokenId] = node;
+        _nodeToToken[node] = tokenId;
         _safeMint(owner_, tokenId);
 
         emit DomainRegistered(node, label, owner_, expiry);
@@ -211,7 +260,36 @@ contract GraphiteDNSRegistry is
         return node;
     }
 
-    /// @notice Meta‐transfer with EIP-712 signature
+    // ===== TRANSFER FUNCTIONS =====
+
+    /// @notice Override ERC721 transfer to update domain ownership
+    function _update(address to, uint256 tokenId, address auth) internal override returns (address) {
+        address from = _ownerOf(tokenId);
+        address previousOwner = super._update(to, tokenId, auth);
+        
+        if (from != address(0) && to != address(0)) {
+            // Update domain ownership when NFT is transferred
+            bytes32 node = _tokenToNode[tokenId];
+            if (node != bytes32(0)) {
+                _domains[node].owner = to;
+                emit DomainTransferred(node, from, to);
+            }
+        }
+        
+        return previousOwner;
+    }
+
+    /// @notice Get node associated with tokenId
+    function getNodeOfToken(uint256 tokenId) external view returns (bytes32) {
+        return _tokenToNode[tokenId];
+    }
+
+    /// @notice Get tokenId associated with node
+    function getTokenOfNode(bytes32 node) external view returns (uint256) {
+        return _nodeToToken[node];
+    }
+
+    /// @notice Meta-transfer with EIP-712 signature
     function transferWithSig(
         bytes32 node,
         address from,
@@ -226,16 +304,53 @@ contract GraphiteDNSRegistry is
             abi.encode(_TRANSFER_TYPEHASH, node, from, to, nonce, deadline)
         );
         bytes32 digest = _hashTypedDataV4(structHash);
-        require(digest.recover(sig) == from, "Bad signature");
+        require(digest.recover(sig) == from, "Invalid signature");
 
-        Domain storage d = _domains[node];
-        require(d.owner == from, "Not owner");
-        d.owner = to;
+        Domain storage domain = _domains[node];
+        require(domain.owner == from, "Not domain owner");
+        require(domain.expiry > block.timestamp, "Domain expired");
 
-        uint256 tokenId = uint256(node) % nextId;
+        // Transfer NFT
+        uint256 tokenId = _nodeToToken[node];
+        require(tokenId != 0, "No token for domain");
+        
         _transfer(from, to, tokenId);
+        // Domain ownership updated in _beforeTokenTransfer
+    }
 
-        emit DomainTransferred(node, from, to);
+    // ===== RESOLVER FUNCTIONS =====
+
+    function setResolver(bytes32 node, address resolver_) external {
+        Domain storage domain = _domains[node];
+        require(
+            domain.owner == msg.sender || hasRole(DEFAULT_ADMIN_ROLE, msg.sender),
+            "Not authorized"
+        );
+        
+        domain.resolver = resolver_;
+        emit ResolverUpdated(node, resolver_);
+    }
+
+    // ===== ADMIN FUNCTIONS =====
+
+    function setFixedPrice(
+        string calldata label,
+        uint256 price
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        bytes32 node = _makeNode(TLD_NODE, label);
+        _fixedPrice[node] = price;
+    }
+
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    function withdraw() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        payable(msg.sender).transfer(address(this).balance);
     }
 
     function supportsInterface(

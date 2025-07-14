@@ -5,11 +5,24 @@
   "scripts": {
     "compile": "npx hardhat compile",
     "test": "npx hardhat test",
-    "gas-report": "REPORT_GAS=true npx hardhat test",
-    "coverage": "npx hardhat coverage",
+    "test:core": "npx hardhat test test/CoreFunctionality.test.ts",
+    "test:working": "npx hardhat test test/WorkingFunctionality.test.ts",
+    "test:registry": "npx hardhat test test/GraphiteDNSRegistry.test.ts",
+    "test:subdomain": "npx hardhat test test/SubdomainRegistrar.test.ts",
+    "test:auction": "npx hardhat test test/AuctionRegistrar.test.ts",
+    "test:resolver": "npx hardhat test test/GraphiteResolver.test.ts",
+    "test:reverse": "npx hardhat test test/ReverseRegistrar.test.ts",
+    "test:coverage": "npx hardhat coverage",
+    "test:gas": "REPORT_GAS=true npx hardhat test",
+    "test:integration": "npx hardhat test test/integration/",
     "size": "npx hardhat contract-sizer",
+    "deploy:localhost": "npx hardhat run scripts/deploy.ts --network localhost",
     "deploy:graphiteTestnet": "npx hardhat run scripts/deploy.ts --network graphiteTestnet",
-    "deploy:graphite": "npx hardhat run scripts/deploy.ts --network graphite"
+    "deploy:graphite": "npx hardhat run scripts/deploy.ts --network graphite",
+    "verify:graphiteTestnet": "npx hardhat verify --network graphiteTestnet",
+    "verify:graphite": "npx hardhat verify --network graphite",
+    "lint": "eslint . --ext .ts",
+    "lint:fix": "eslint . --ext .ts --fix"
   },
   "keywords": [],
   "author": "",
@@ -36,5 +49,13 @@
     "dotenv": "^16.5.0",
     "ethers": "^6.14.4",
     "ipfs-http-client": "^60.0.1"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/graphite-network/graphite-dns.git"
+  },
+  "bugs": {
+    "url": "https://github.com/graphite-network/graphite-dns/issues"
+  },
+  "homepage": "https://github.com/graphite-network/graphite-dns#readme"
 }
