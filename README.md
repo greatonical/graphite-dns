@@ -311,7 +311,7 @@ await auction.finalizeAuction("premium", 365 * 24 * 3600, RESOLVER_ADDRESS);
 
 1. **Comprehensive Access Control**: Every function has proper role-based or ownership validation
 2. **Reentrancy Protection**: All payable functions use `nonReentrant`
-3. **Overflow Protection**: Solidity 0.8.28 with built-in overflow checks
+3. **Overflow Protection**: Solidity 0.8.17 with built-in overflow checks
 4. **Input Validation**: Extensive validation on all user inputs
 5. **Pause Mechanisms**: Emergency pause functionality
 6. **Expiry Validation**: All operations check domain expiry
