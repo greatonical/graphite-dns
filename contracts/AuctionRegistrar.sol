@@ -1,552 +1,75 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.17;
+pragma solidity ^0.8.28;
 
+import "./interfaces/IGraphiteDNSRegistry.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
-interface IGraphiteDNSRegistry {
-    function register(
-        string calldata name,
-        address owner,
-        uint64 duration,
-        address resolver,
-        bytes32 parent
-    ) external payable returns (bytes32);
-    
-    function isAvailable(bytes32 node) external view returns (bool);
-    function TLD_NODE() external view returns (bytes32);
-}
-
-/**
- * @title AuctionRegistrar
- * @dev Enhanced auction system with anti-sniping and proper fund handling
- */
-contract AuctionRegistrar is 
-    AccessControl, 
-    Pausable, 
-    ReentrancyGuard,
-    UUPSUpgradeable 
-{
-    using ECDSA for bytes32;
-
+contract AuctionRegistrar is AccessControl, ReentrancyGuard, Pausable {
     IGraphiteDNSRegistry public immutable registry;
     bytes32 public immutable TLD_NODE;
-    
-    bytes32 public constant AUCTIONEER_ROLE = keccak256("AUCTIONEER_ROLE");
-    
-    // Anti-sniping settings
-    uint256 public constant EXTENSION_WINDOW = 10 minutes;
-    uint256 public constant EXTENSION_DURATION = 10 minutes;
-    uint256 public constant MIN_BID_INCREMENT = 0.01 ether;
+
     uint256 public constant MIN_COMMIT_DURATION = 1 hours;
+    uint256 public constant MAX_COMMIT_DURATION = 7 days;
     uint256 public constant MIN_REVEAL_DURATION = 1 hours;
-    uint256 public constant MAX_AUCTION_DURATION = 7 days;
-    
-    enum AuctionState {
-        None,
-        Commit,
-        Reveal,
-        Ended,
-        Finalized
-    }
-    
+    uint256 public constant MAX_REVEAL_DURATION = 3 days;
+    uint256 public constant ANTI_SNIPE_DURATION = 10 minutes;
+
     struct Auction {
-        string name;
-        uint256 commitStart;
         uint256 commitEnd;
         uint256 revealEnd;
-        uint256 minBid;
         address highestBidder;
         uint256 highestBid;
         uint256 secondHighestBid;
-        AuctionState state;
+        bool finalized;
+        bool extended;
         mapping(address => bytes32) commitments;
         mapping(address => uint256) deposits;
-        mapping(address => bool) revealed;
-        address[] bidders;
-        uint256 totalDeposits;
-        bool fundsWithdrawn;
+        mapping(address => bool) hasRevealed;
     }
-    
-    mapping(bytes32 => Auction) private _auctions;
-    mapping(address => uint256) private _pendingWithdrawals;
-    
-    // Events with comprehensive data for indexing
+
+    mapping(bytes32 => Auction) private auctions;
+    mapping(address => uint256) private pendingReturns;
+
     event AuctionStarted(
         bytes32 indexed node,
-        string name,
-        uint256 commitStart,
+        string label,
         uint256 commitEnd,
-        uint256 revealEnd,
-        uint256 minBid
+        uint256 revealEnd
     );
-    
     event BidCommitted(
         bytes32 indexed node,
         address indexed bidder,
-        bytes32 commitment,
-        uint256 deposit,
-        uint256 timestamp
+        bytes32 commitment
     );
-    
     event BidRevealed(
         bytes32 indexed node,
         address indexed bidder,
-        uint256 bid,
-        uint256 deposit,
-        bool isValid,
-        uint256 timestamp
+        uint256 amount,
+        bool isHighest
     );
-    
-    event NewHighestBid(
-        bytes32 indexed node,
-        address indexed bidder,
-        uint256 bid,
-        uint256 previousBid,
-        address previousBidder
-    );
-    
     event AuctionExtended(
         bytes32 indexed node,
-        uint256 newRevealEnd,
-        address triggeringBidder
+        uint256 newRevealEnd
     );
-    
     event AuctionFinalized(
         bytes32 indexed node,
         address indexed winner,
         uint256 winningBid,
-        uint256 totalRefunded
+        uint256 paidAmount
     );
-    
-    event AuctionCancelled(
-        bytes32 indexed node,
-        string reason,
-        uint256 totalRefunded
-    );
-    
-    event WithdrawalProcessed(
-        address indexed account,
+    event FundsWithdrawn(
+        address indexed bidder,
         uint256 amount
     );
 
-    constructor(address _registry) {
-        registry = IGraphiteDNSRegistry(_registry);
+    constructor(address registryAddress) {
+        registry = IGraphiteDNSRegistry(registryAddress);
         TLD_NODE = registry.TLD_NODE();
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(AUCTIONEER_ROLE, msg.sender);
     }
 
-    modifier validAuctionParams(
-        uint256 commitDuration,
-        uint256 revealDuration,
-        uint256 minBid
-    ) {
-        require(commitDuration >= MIN_COMMIT_DURATION, "Commit duration too short");
-        require(revealDuration >= MIN_REVEAL_DURATION, "Reveal duration too short");
-        require(commitDuration + revealDuration <= MAX_AUCTION_DURATION, "Total duration too long");
-        require(minBid > 0, "Minimum bid must be positive");
-        _;
-    }
-
-    modifier onlyValidName(string memory name) {
-        require(bytes(name).length > 0, "Empty name");
-        require(bytes(name).length <= 63, "Name too long");
-        _;
-    }
-
-    // Start auction
-    function startAuction(
-        string calldata name,
-        uint256 commitDuration,
-        uint256 revealDuration,
-        uint256 minBid
-    )
-        external
-        onlyRole(AUCTIONEER_ROLE)
-        whenNotPaused
-        nonReentrant
-        onlyValidName(name)
-        validAuctionParams(commitDuration, revealDuration, minBid)
-    {
-        bytes32 node = _makeNode(name);
-        require(registry.isAvailable(node), "Name not available");
-        require(_auctions[node].state == AuctionState.None, "Auction already exists");
-
-        Auction storage auction = _auctions[node];
-        auction.name = name;
-        auction.commitStart = block.timestamp;
-        auction.commitEnd = block.timestamp + commitDuration;
-        auction.revealEnd = auction.commitEnd + revealDuration;
-        auction.minBid = minBid;
-        auction.state = AuctionState.Commit;
-
-        emit AuctionStarted(
-            node,
-            name,
-            auction.commitStart,
-            auction.commitEnd,
-            auction.revealEnd,
-            minBid
-        );
-    }
-
-    // Commit bid
-    function commitBid(string calldata name, bytes32 commitment)
-        external
-        payable
-        whenNotPaused
-        nonReentrant
-        onlyValidName(name)
-    {
-        bytes32 node = _makeNode(name);
-        Auction storage auction = _auctions[node];
-        
-        require(auction.state == AuctionState.Commit, "Not in commit phase");
-        require(block.timestamp >= auction.commitStart, "Commit phase not started");
-        require(block.timestamp <= auction.commitEnd, "Commit phase ended");
-        require(auction.commitments[msg.sender] == bytes32(0), "Already committed");
-        require(msg.value >= auction.minBid, "Deposit below minimum bid");
-        require(commitment != bytes32(0), "Invalid commitment");
-
-        auction.commitments[msg.sender] = commitment;
-        auction.deposits[msg.sender] = msg.value;
-        auction.bidders.push(msg.sender);
-        auction.totalDeposits += msg.value;
-
-        emit BidCommitted(node, msg.sender, commitment, msg.value, block.timestamp);
-    }
-
-    // Reveal bid with anti-sniping
-    function revealBid(
-        string calldata name,
-        uint256 bid,
-        bytes32 salt
-    )
-        external
-        whenNotPaused
-        nonReentrant
-        onlyValidName(name)
-    {
-        bytes32 node = _makeNode(name);
-        Auction storage auction = _auctions[node];
-        
-        require(auction.state == AuctionState.Commit || auction.state == AuctionState.Reveal, "Wrong phase");
-        require(block.timestamp >= auction.commitEnd, "Reveal phase not started");
-        require(block.timestamp <= auction.revealEnd, "Reveal phase ended");
-        require(!auction.revealed[msg.sender], "Already revealed");
-        require(auction.commitments[msg.sender] != bytes32(0), "No commitment found");
-
-        // Transition to reveal state if first reveal
-        if (auction.state == AuctionState.Commit) {
-            auction.state = AuctionState.Reveal;
-        }
-
-        // Verify commitment
-        bytes32 expectedCommitment = keccak256(abi.encodePacked(bid, salt, msg.sender));
-        bool isValidBid = (expectedCommitment == auction.commitments[msg.sender]) &&
-                         (bid >= auction.minBid) &&
-                         (auction.deposits[msg.sender] >= bid);
-
-        auction.revealed[msg.sender] = true;
-
-        emit BidRevealed(node, msg.sender, bid, auction.deposits[msg.sender], isValidBid, block.timestamp);
-
-        if (isValidBid && bid > auction.highestBid) {
-            // Check for anti-sniping extension
-            if (block.timestamp > auction.revealEnd - EXTENSION_WINDOW) {
-                auction.revealEnd += EXTENSION_DURATION;
-                emit AuctionExtended(node, auction.revealEnd, msg.sender);
-            }
-
-            address previousBidder = auction.highestBidder;
-            uint256 previousBid = auction.highestBid;
-
-            auction.secondHighestBid = auction.highestBid;
-            auction.highestBid = bid;
-            auction.highestBidder = msg.sender;
-
-            emit NewHighestBid(node, msg.sender, bid, previousBid, previousBidder);
-        } else if (!isValidBid) {
-            // Invalid bid - add to pending withdrawals
-            _pendingWithdrawals[msg.sender] += auction.deposits[msg.sender];
-        }
-    }
-
-    // Finalize auction
-    function finalizeAuction(
-        string calldata name,
-        uint64 duration,
-        address resolver
-    )
-        external
-        whenNotPaused
-        nonReentrant
-        onlyValidName(name)
-    {
-        bytes32 node = _makeNode(name);
-        Auction storage auction = _auctions[node];
-        
-        require(auction.state == AuctionState.Reveal, "Not in reveal phase");
-        require(block.timestamp > auction.revealEnd, "Reveal phase not ended");
-        require(!auction.fundsWithdrawn, "Already finalized");
-
-        auction.state = AuctionState.Ended;
-        auction.fundsWithdrawn = true;
-
-        if (auction.highestBidder == address(0)) {
-            // No valid bids - refund all deposits
-            auction.state = AuctionState.Finalized;
-            _refundAllBidders(node);
-            emit AuctionCancelled(node, "No valid bids", auction.totalDeposits);
-            return;
-        }
-
-        // Calculate payment (Vickrey auction - pay second highest bid)
-        uint256 paymentAmount = auction.secondHighestBid > 0 ? 
-                               auction.secondHighestBid : 
-                               auction.highestBid;
-
-        // Register domain to winner
-        try registry.register{value: paymentAmount}(
-            name,
-            auction.highestBidder,
-            duration,
-            resolver,
-            TLD_NODE
-        ) {
-            auction.state = AuctionState.Finalized;
-            
-            // Process refunds
-            uint256 totalRefunded = _processRefunds(node, paymentAmount);
-            
-            emit AuctionFinalized(node, auction.highestBidder, paymentAmount, totalRefunded);
-        } catch {
-            // Registration failed - refund all and cancel
-            auction.state = AuctionState.Finalized;
-            auction.fundsWithdrawn = false;
-            _refundAllBidders(node);
-            emit AuctionCancelled(node, "Registration failed", auction.totalDeposits);
-        }
-    }
-
-    // Cancel auction (admin only)
-    function cancelAuction(string calldata name, string calldata reason)
-        external
-        onlyRole(DEFAULT_ADMIN_ROLE)
-        whenNotPaused
-        nonReentrant
-    {
-        bytes32 node = _makeNode(name);
-        Auction storage auction = _auctions[node];
-        
-        require(auction.state != AuctionState.None, "Auction does not exist");
-        require(auction.state != AuctionState.Finalized, "Already finalized");
-
-        auction.state = AuctionState.Finalized;
-        uint256 totalRefunded = _refundAllBidders(node);
-        
-        emit AuctionCancelled(node, reason, totalRefunded);
-    }
-
-    // Withdraw pending funds
-    function withdraw() external nonReentrant {
-        uint256 amount = _pendingWithdrawals[msg.sender];
-        require(amount > 0, "No funds to withdraw");
-        
-        _pendingWithdrawals[msg.sender] = 0;
-        
-        (bool success, ) = payable(msg.sender).call{value: amount}("");
-        require(success, "Withdrawal failed");
-        
-        emit WithdrawalProcessed(msg.sender, amount);
-    }
-
-    // Emergency withdrawal for specific user (admin only)
-    function emergencyWithdraw(address user) 
-        external 
-        onlyRole(DEFAULT_ADMIN_ROLE) 
-        nonReentrant 
-    {
-        uint256 amount = _pendingWithdrawals[user];
-        require(amount > 0, "No funds to withdraw");
-        
-        _pendingWithdrawals[user] = 0;
-        
-        (bool success, ) = payable(user).call{value: amount}("");
-        require(success, "Emergency withdrawal failed");
-        
-        emit WithdrawalProcessed(user, amount);
-    }
-
-    // Internal functions
-    function _makeNode(string memory name) internal view returns (bytes32) {
-        return keccak256(abi.encodePacked(TLD_NODE, keccak256(bytes(name))));
-    }
-
-    function _processRefunds(bytes32 node, uint256 paymentAmount) internal returns (uint256 totalRefunded) {
-        Auction storage auction = _auctions[node];
-        
-        for (uint256 i = 0; i < auction.bidders.length; i++) {
-            address bidder = auction.bidders[i];
-            uint256 deposit = auction.deposits[bidder];
-            
-            if (bidder == auction.highestBidder) {
-                // Winner pays second highest bid, gets difference refunded
-                uint256 refund = deposit - paymentAmount;
-                if (refund > 0) {
-                    _pendingWithdrawals[bidder] += refund;
-                    totalRefunded += refund;
-                }
-            } else {
-                // All other bidders get full refund
-                _pendingWithdrawals[bidder] += deposit;
-                totalRefunded += deposit;
-            }
-        }
-    }
-
-    function _refundAllBidders(bytes32 node) internal returns (uint256 totalRefunded) {
-        Auction storage auction = _auctions[node];
-        
-        for (uint256 i = 0; i < auction.bidders.length; i++) {
-            address bidder = auction.bidders[i];
-            uint256 deposit = auction.deposits[bidder];
-            
-            _pendingWithdrawals[bidder] += deposit;
-            totalRefunded += deposit;
-        }
-    }
-
-    // View functions
-    function getAuction(string calldata name) 
-        external 
-        view 
-        returns (
-            AuctionState state,
-            uint256 commitStart,
-            uint256 commitEnd,
-            uint256 revealEnd,
-            uint256 minBid,
-            address highestBidder,
-            uint256 highestBid,
-            uint256 secondHighestBid,
-            uint256 totalDeposits,
-            uint256 bidderCount
-        ) 
-    {
-        bytes32 node = _makeNode(name);
-        Auction storage auction = _auctions[node];
-        
-        return (
-            auction.state,
-            auction.commitStart,
-            auction.commitEnd,
-            auction.revealEnd,
-            auction.minBid,
-            auction.highestBidder,
-            auction.highestBid,
-            auction.secondHighestBid,
-            auction.totalDeposits,
-            auction.bidders.length
-        );
-    }
-
-    function getBidderInfo(string calldata name, address bidder)
-        external
-        view
-        returns (
-            bytes32 commitment,
-            uint256 deposit,
-            bool revealed
-        )
-    {
-        bytes32 node = _makeNode(name);
-        Auction storage auction = _auctions[node];
-        
-        return (
-            auction.commitments[bidder],
-            auction.deposits[bidder],
-            auction.revealed[bidder]
-        );
-    }
-
-    function getAllBidders(string calldata name) 
-        external 
-        view 
-        returns (address[] memory) 
-    {
-        bytes32 node = _makeNode(name);
-        return _auctions[node].bidders;
-    }
-
-    function pendingWithdrawal(address account) external view returns (uint256) {
-        return _pendingWithdrawals[account];
-    }
-
-    function generateCommitment(
-        uint256 bid,
-        bytes32 salt,
-        address bidder
-    ) external pure returns (bytes32) {
-        return keccak256(abi.encodePacked(bid, salt, bidder));
-    }
-
-    function isValidCommitment(
-        string calldata name,
-        address bidder,
-        uint256 bid,
-        bytes32 salt
-    ) external view returns (bool) {
-        bytes32 node = _makeNode(name);
-        bytes32 stored = _auctions[node].commitments[bidder];
-        bytes32 expected = keccak256(abi.encodePacked(bid, salt, bidder));
-        return stored == expected && stored != bytes32(0);
-    }
-
-    function getCurrentPhase(string calldata name) 
-        external 
-        view 
-        returns (AuctionState phase, uint256 timeRemaining) 
-    {
-        bytes32 node = _makeNode(name);
-        Auction storage auction = _auctions[node];
-        
-        if (auction.state == AuctionState.None) {
-            return (AuctionState.None, 0);
-        }
-        
-        if (auction.state == AuctionState.Finalized) {
-            return (AuctionState.Finalized, 0);
-        }
-        
-        if (block.timestamp <= auction.commitEnd) {
-            return (AuctionState.Commit, auction.commitEnd - block.timestamp);
-        } else if (block.timestamp <= auction.revealEnd) {
-            return (AuctionState.Reveal, auction.revealEnd - block.timestamp);
-        } else {
-            return (AuctionState.Ended, 0);
-        }
-    }
-
-    function getAuctionStats() 
-        external 
-        view 
-        returns (
-            uint256 totalAuctions,
-            uint256 activeAuctions,
-            uint256 totalValueLocked
-        ) 
-    {
-        // Note: This would require additional tracking in a production system
-        // For now, returning placeholder values
-        return (0, 0, address(this).balance);
-    }
-
-    // Admin functions
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _pause();
     }
@@ -555,31 +78,239 @@ contract AuctionRegistrar is
         _unpause();
     }
 
-    function withdrawTreasury() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        uint256 balance = address(this).balance;
-        require(balance > 0, "No funds to withdraw");
-        
-        (bool success, ) = payable(msg.sender).call{value: balance}("");
-        require(success, "Treasury withdrawal failed");
+    // ============ Auction Management ============
+
+    function startAuction(
+        string calldata label,
+        uint256 commitDuration,
+        uint256 revealDuration
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) whenNotPaused {
+        require(
+            commitDuration >= MIN_COMMIT_DURATION && commitDuration <= MAX_COMMIT_DURATION,
+            "Invalid commit duration"
+        );
+        require(
+            revealDuration >= MIN_REVEAL_DURATION && revealDuration <= MAX_REVEAL_DURATION,
+            "Invalid reveal duration"
+        );
+
+        bytes32 node = keccak256(abi.encodePacked(TLD_NODE, keccak256(bytes(label))));
+        require(registry.isAvailable(node), "Domain not available");
+
+        Auction storage auction = auctions[node];
+        require(auction.commitEnd == 0, "Auction already exists");
+
+        auction.commitEnd = block.timestamp + commitDuration;
+        auction.revealEnd = auction.commitEnd + revealDuration;
+
+        emit AuctionStarted(node, label, auction.commitEnd, auction.revealEnd);
     }
 
-    function _authorizeUpgrade(address newImplementation) 
-        internal 
-        override 
-        onlyRole(DEFAULT_ADMIN_ROLE) 
-    {}
+    // ============ Bidding Functions ============
 
-    function supportsInterface(bytes4 interfaceId) 
-        public 
+    function commitBid(string calldata label, bytes32 commitment) 
+        external 
+        whenNotPaused 
+    {
+        bytes32 node = keccak256(abi.encodePacked(TLD_NODE, keccak256(bytes(label))));
+        Auction storage auction = auctions[node];
+        
+        require(auction.commitEnd > 0, "Auction does not exist");
+        require(block.timestamp < auction.commitEnd, "Commit phase ended");
+        require(auction.commitments[msg.sender] == bytes32(0), "Already committed");
+
+        auction.commitments[msg.sender] = commitment;
+        emit BidCommitted(node, msg.sender, commitment);
+    }
+
+    function revealBid(
+        string calldata label,
+        uint256 bid,
+        bytes32 salt
+    ) external payable whenNotPaused nonReentrant {
+        bytes32 node = keccak256(abi.encodePacked(TLD_NODE, keccak256(bytes(label))));
+        Auction storage auction = auctions[node];
+
+        require(block.timestamp >= auction.commitEnd, "Commit phase not ended");
+        require(block.timestamp < auction.revealEnd, "Reveal phase ended");
+        require(!auction.hasRevealed[msg.sender], "Already revealed");
+
+        // Verify commitment
+        bytes32 commitment = keccak256(abi.encodePacked(msg.sender, bid, salt));
+        require(auction.commitments[msg.sender] == commitment, "Invalid commitment");
+
+        auction.hasRevealed[msg.sender] = true;
+        auction.deposits[msg.sender] = msg.value;
+
+        require(msg.value >= bid, "Insufficient deposit");
+
+        bool isHighest = false;
+        bool extended = false;
+
+        // Check if this is a new highest bid
+        if (bid > auction.highestBid) {
+            // Update second highest
+            auction.secondHighestBid = auction.highestBid;
+            
+            // Set new highest
+            auction.highestBid = bid;
+            auction.highestBidder = msg.sender;
+            isHighest = true;
+
+            // Anti-sniping: extend auction if bid comes in last 10 minutes
+            if (block.timestamp > auction.revealEnd - ANTI_SNIPE_DURATION && !auction.extended) {
+                auction.revealEnd = block.timestamp + ANTI_SNIPE_DURATION;
+                auction.extended = true;
+                extended = true;
+                emit AuctionExtended(node, auction.revealEnd);
+            }
+        } else if (bid > auction.secondHighestBid) {
+            auction.secondHighestBid = bid;
+        }
+
+        emit BidRevealed(node, msg.sender, bid, isHighest);
+
+        if (extended) {
+            emit AuctionExtended(node, auction.revealEnd);
+        }
+    }
+
+    // ============ Finalization ============
+
+    function finalizeAuction(
+        string calldata label,
+        address resolver_,
+        uint64 duration
+    ) external whenNotPaused nonReentrant {
+        bytes32 node = keccak256(abi.encodePacked(TLD_NODE, keccak256(bytes(label))));
+        Auction storage auction = auctions[node];
+
+        require(auction.commitEnd > 0, "Auction does not exist");
+        require(block.timestamp >= auction.revealEnd, "Auction not ended");
+        require(!auction.finalized, "Already finalized");
+        require(auction.highestBidder != address(0), "No valid bids");
+
+        auction.finalized = true;
+
+        // In Vickrey auction, winner pays second-highest price
+        uint256 paidAmount = auction.secondHighestBid > 0 ? auction.secondHighestBid : auction.highestBid;
+        
+        // Register domain
+        registry.register{value: paidAmount}(
+            label,
+            auction.highestBidder,
+            duration,
+            resolver_,
+            TLD_NODE
+        );
+
+        // Handle refunds
+        uint256 winnerDeposit = auction.deposits[auction.highestBidder];
+        if (winnerDeposit > paidAmount) {
+            pendingReturns[auction.highestBidder] += winnerDeposit - paidAmount;
+        }
+
+        emit AuctionFinalized(node, auction.highestBidder, auction.highestBid, paidAmount);
+    }
+
+    // ============ Withdrawal Functions ============
+
+    function withdraw() external nonReentrant {
+        uint256 amount = pendingReturns[msg.sender];
+        require(amount > 0, "No funds to withdraw");
+
+        pendingReturns[msg.sender] = 0;
+        payable(msg.sender).transfer(amount);
+
+        emit FundsWithdrawn(msg.sender, amount);
+    }
+
+    function withdrawForBidder(bytes32 node, address bidder) 
+        external 
+        nonReentrant 
+    {
+        Auction storage auction = auctions[node];
+        require(auction.finalized, "Auction not finalized");
+        require(bidder != auction.highestBidder, "Winner cannot use this function");
+
+        uint256 deposit = auction.deposits[bidder];
+        require(deposit > 0, "No deposit to withdraw");
+
+        auction.deposits[bidder] = 0;
+        pendingReturns[bidder] += deposit;
+    }
+
+    // ============ View Functions ============
+
+    function getAuctionInfo(bytes32 node) 
+        external 
         view 
-        override(AccessControl) 
+        returns (
+            uint256 commitEnd,
+            uint256 revealEnd,
+            address highestBidder,
+            uint256 highestBid,
+            uint256 secondHighestBid,
+            bool finalized
+        ) 
+    {
+        Auction storage auction = auctions[node];
+        return (
+            auction.commitEnd,
+            auction.revealEnd,
+            auction.highestBidder,
+            auction.highestBid,
+            auction.secondHighestBid,
+            auction.finalized
+        );
+    }
+
+    function getCommitment(bytes32 node, address bidder) 
+        external 
+        view 
+        returns (bytes32) 
+    {
+        return auctions[node].commitments[bidder];
+    }
+
+    function hasRevealed(bytes32 node, address bidder) 
+        external 
+        view 
         returns (bool) 
     {
-        return super.supportsInterface(interfaceId);
+        return auctions[node].hasRevealed[bidder];
     }
 
-    // Fallback for direct payments (will be added to pending withdrawals)
-    receive() external payable {
-        _pendingWithdrawals[msg.sender] += msg.value;
+    function getPendingReturns(address bidder) 
+        external 
+        view 
+        returns (uint256) 
+    {
+        return pendingReturns[bidder];
+    }
+
+    function getDeposit(bytes32 node, address bidder) 
+        external 
+        view 
+        returns (uint256) 
+    {
+        return auctions[node].deposits[bidder];
+    }
+
+    // ============ Emergency Functions ============
+
+    function emergencyWithdraw() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        payable(msg.sender).transfer(address(this).balance);
+    }
+
+    // ============ Interface Support ============
+
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(AccessControl)
+        returns (bool)
+    {
+        return super.supportsInterface(interfaceId);
     }
 }

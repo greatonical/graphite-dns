@@ -7,5 +7,16 @@
     "strict": true,
     "skipLibCheck": true,
     "resolveJsonModule": true
-  }
+  },
+   "include": [
+    "./scripts",
+    "./test",
+    "./typechain/**/*"
+  ],
+   "exclude": [
+    "./node_modules",
+    "dist",
+    "artifacts",
+    "cache"
+  ]
 }

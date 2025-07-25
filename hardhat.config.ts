@@ -16,12 +16,13 @@ const config: HardhatUserConfig = {
   solidity: {
     compilers: [
       {
-        version: "0.8.17",
-        settings: { 
-          optimizer: { 
-            enabled: true, 
-            runs: 200 
-          }
+        version: "0.8.28",
+        settings: {
+          optimizer: {
+            enabled: true,
+            runs: 200,
+          },
+          viaIR: true,
         },
       },
     ],
@@ -31,6 +32,12 @@ const config: HardhatUserConfig = {
     // Clean local blockchain for testing (no forking)
     hardhat: {
       chainId: 31337,
+      gas: 30000000,
+      gasPrice: 20000000000, // 20 gwei
+      accounts: {
+        count: 20,
+        accountsBalance: "10000000000000000000000", // 10k ETH
+      },
       // Remove forking configuration to use clean local blockchain
       // forking: {
       //   url: process.env.GRAPHITE_MAINNET_RPC_URL!,
@@ -106,13 +113,17 @@ const config: HardhatUserConfig = {
   typechain: {
     outDir: "typechain",
     target: "ethers-v6",
+    alwaysGenerateOverloads: false,
+    externalArtifacts: [
+      "node_modules/@openzeppelin/contracts/build/contracts/*.json",
+    ],
   },
 
   paths: {
-    sources: "contracts",
-    tests: "test",
-    cache: "cache",
-    artifacts: "artifacts",
+    sources: "./contracts",
+    tests: "./test",
+    cache: "./cache",
+    artifacts: "./artifacts",
   },
 
   mocha: {
