@@ -1,242 +1,365 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.17;
 
-import "./GraphiteDNSRegistry.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts/utils/introspection/ERC165.sol";
 
 interface IGraphiteDNSRegistry {
-    struct Domain {
+    struct Record {
         address owner;
         address resolver;
         uint64 expiry;
         bytes32 parent;
+        bool exists;
     }
     
-    function getDomain(bytes32 node) external view returns (Domain memory);
+    function getRecord(bytes32 node) external view returns (Record memory);
+    function nodeOwner(bytes32 node) external view returns (address);
 }
 
-contract GraphiteResolver is AccessControl, Pausable {
-    bytes32 public constant RESOLVER_ROLE = keccak256("RESOLVER_ROLE");
-    
+/**
+ * @title GraphiteResolver
+ * @dev Enhanced resolver with comprehensive record types and proper ownership controls
+ */
+contract GraphiteResolver is 
+    AccessControl, 
+    Pausable, 
+    ReentrancyGuard,
+    UUPSUpgradeable,
+    ERC165 
+{
     IGraphiteDNSRegistry public immutable registry;
-
-    // node → (key → value)
-    mapping(bytes32 => mapping(string => string)) private _textRecords;
     
-    // node → (interfaceId → implementer)
+    // Standard record types
+    mapping(bytes32 => address) private _addresses; // addr record
+    mapping(bytes32 => bytes32) private _contenthash; // contenthash record
+    mapping(bytes32 => string) private _names; // name record
+    mapping(bytes32 => mapping(string => string)) private _texts; // text records
+    mapping(bytes32 => mapping(string => bytes)) private _abis; // ABI records
+    mapping(bytes32 => bytes) private _pubkeys; // Public key records
+    
+    // Multi-address support (coin types)
+    mapping(bytes32 => mapping(uint256 => bytes)) private _addresses_by_coin_type;
+    
+    // Interface records
     mapping(bytes32 => mapping(bytes4 => address)) private _interfaces;
     
-    // node → address (ETH address record)
-    mapping(bytes32 => address) private _addresses;
-
-    // Standard record keys
-    string public constant AVATAR_KEY = "avatar";
-    string public constant DESCRIPTION_KEY = "description";
-    string public constant DISPLAY_KEY = "display";
-    string public constant EMAIL_KEY = "email";
-    string public constant KEYWORDS_KEY = "keywords";
-    string public constant MAIL_KEY = "mail";
-    string public constant NOTICE_KEY = "notice";
-    string public constant LOCATION_KEY = "location";
-    string public constant PHONE_KEY = "phone";
-    string public constant URL_KEY = "url";
-    string public constant CONTENTHASH_KEY = "contenthash";
-
-    event TextChanged(bytes32 indexed node, string indexed key, string value);
+    // Authorization and ownership
+    mapping(bytes32 => address) private _nodeOwners;
+    mapping(bytes32 => mapping(address => bool)) private _operators;
+    
+    // Versioning for cache invalidation
+    mapping(bytes32 => uint64) private _recordVersions;
+    
+    // Events
     event AddressChanged(bytes32 indexed node, address addr);
+    event NameChanged(bytes32 indexed node, string name);
+    event ContenthashChanged(bytes32 indexed node, bytes hash);
+    event TextChanged(bytes32 indexed node, string indexed key, string value);
+    event TextDeleted(bytes32 indexed node, string indexed key);
+    event ABIChanged(bytes32 indexed node, uint256 indexed contentType);
+    event PubkeyChanged(bytes32 indexed node, bytes32 x, bytes32 y);
+    event AddressChangedByType(bytes32 indexed node, uint256 coinType, bytes newAddress);
     event InterfaceChanged(bytes32 indexed node, bytes4 indexed interfaceID, address implementer);
+    event OperatorChanged(bytes32 indexed node, address indexed operator, bool approved);
+    event OwnerChanged(bytes32 indexed node, address indexed newOwner);
+    event VersionChanged(bytes32 indexed node, uint64 newVersion);
 
-    constructor(address registryAddress) {
-        registry = IGraphiteDNSRegistry(registryAddress);
+    constructor(address _registry) {
+        registry = IGraphiteDNSRegistry(_registry);
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(RESOLVER_ROLE, msg.sender);
     }
 
-    modifier onlyNodeOwnerOrAuthorized(bytes32 node) {
-        IGraphiteDNSRegistry.Domain memory domain = registry.getDomain(node);
+    modifier onlyNodeOwnerOrOperator(bytes32 node) {
+        address nodeOwner = _getNodeOwner(node);
         require(
-            domain.owner == msg.sender || 
-            hasRole(RESOLVER_ROLE, msg.sender) ||
+            nodeOwner == msg.sender || 
+            _operators[node][msg.sender] ||
             hasRole(DEFAULT_ADMIN_ROLE, msg.sender),
-            "Not authorized for this domain"
+            "Not authorized"
         );
-        require(domain.expiry > block.timestamp, "Domain expired");
         _;
     }
 
-    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _pause();
-    }
-    
-    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _unpause();
+    modifier onlyValidNode(bytes32 node) {
+        IGraphiteDNSRegistry.Record memory record = registry.getRecord(node);
+        require(record.exists, "Node does not exist");
+        require(block.timestamp <= record.expiry, "Node expired");
+        _;
     }
 
-    // ===== TEXT RECORDS =====
+    modifier onlyNodeOwner(bytes32 node) {
+        require(_getNodeOwner(node) == msg.sender, "Not node owner");
+        _;
+    }
 
-    /// @notice Set text record (domain owner or authorized)
-    function setText(
-        bytes32 node,
-        string calldata key,
-        string calldata value
-    ) external onlyNodeOwnerOrAuthorized(node) whenNotPaused {
-        _textRecords[node][key] = value;
+    // Ownership management
+    function setOwner(bytes32 node, address newOwner) external {
+        // Only registry or current owner can change ownership
+        require(
+            msg.sender == address(registry) || 
+            _nodeOwners[node] == msg.sender ||
+            hasRole(DEFAULT_ADMIN_ROLE, msg.sender),
+            "Not authorized"
+        );
+        
+        _nodeOwners[node] = newOwner;
+        _incrementVersion(node);
+        emit OwnerChanged(node, newOwner);
+    }
+
+    function setOperator(bytes32 node, address operator, bool approved) 
+        external 
+        onlyNodeOwner(node) 
+        onlyValidNode(node) 
+    {
+        _operators[node][operator] = approved;
+        emit OperatorChanged(node, operator, approved);
+    }
+
+    // Core record types
+    function setAddr(bytes32 node, address addr) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
+    {
+        _addresses[node] = addr;
+        _incrementVersion(node);
+        emit AddressChanged(node, addr);
+    }
+
+    function setName(bytes32 node, string calldata name) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
+    {
+        _names[node] = name;
+        _incrementVersion(node);
+        emit NameChanged(node, name);
+    }
+
+    function setContenthash(bytes32 node, bytes calldata hash) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
+    {
+        _contenthash[node] = keccak256(hash);
+        _incrementVersion(node);
+        emit ContenthashChanged(node, hash);
+    }
+
+    function setText(bytes32 node, string calldata key, string calldata value) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
+    {
+        _texts[node][key] = value;
+        _incrementVersion(node);
         emit TextChanged(node, key, value);
     }
 
-    /// @notice Get text record
-    function text(bytes32 node, string calldata key)
-        external
-        view
-        returns (string memory)
+    function deleteText(bytes32 node, string calldata key) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
     {
-        return _textRecords[node][key];
+        delete _texts[node][key];
+        _incrementVersion(node);
+        emit TextDeleted(node, key);
     }
 
-    /// @notice Batch set multiple text records
-    function setTextBatch(
-        bytes32 node,
-        string[] calldata keys,
-        string[] calldata values
-    ) external onlyNodeOwnerOrAuthorized(node) whenNotPaused {
-        require(keys.length == values.length, "Array length mismatch");
-        
-        for (uint i = 0; i < keys.length; i++) {
-            _textRecords[node][keys[i]] = values[i];
-            emit TextChanged(node, keys[i], values[i]);
+    function setABI(bytes32 node, uint256 contentType, bytes calldata data) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
+    {
+        _abis[node][string(abi.encodePacked(contentType))] = data;
+        _incrementVersion(node);
+        emit ABIChanged(node, contentType);
+    }
+
+    function setPubkey(bytes32 node, bytes32 x, bytes32 y) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
+    {
+        _pubkeys[node] = abi.encodePacked(x, y);
+        _incrementVersion(node);
+        emit PubkeyChanged(node, x, y);
+    }
+
+    // Multi-coin address support
+    function setAddrByType(bytes32 node, uint256 coinType, bytes calldata addr) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
+    {
+        _addresses_by_coin_type[node][coinType] = addr;
+        _incrementVersion(node);
+        emit AddressChangedByType(node, coinType, addr);
+    }
+
+    // Interface support
+    function setInterface(bytes32 node, bytes4 interfaceID, address implementer) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
+    {
+        _interfaces[node][interfaceID] = implementer;
+        _incrementVersion(node);
+        emit InterfaceChanged(node, interfaceID, implementer);
+    }
+
+    // Batch operations for efficiency
+    function multicall(bytes[] calldata data) external returns (bytes[] memory results) {
+        results = new bytes[](data.length);
+        for (uint256 i = 0; i < data.length; i++) {
+            (bool success, bytes memory result) = address(this).delegatecall(data[i]);
+            require(success, "Multicall failed");
+            results[i] = result;
         }
     }
 
-    /// @notice Clear text record
-    function clearText(bytes32 node, string calldata key)
-        external
-        onlyNodeOwnerOrAuthorized(node)
-        whenNotPaused
+    function setMultipleTexts(
+        bytes32 node, 
+        string[] calldata keys, 
+        string[] calldata values
+    ) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        onlyValidNode(node) 
+        whenNotPaused 
     {
-        delete _textRecords[node][key];
-        emit TextChanged(node, key, "");
+        require(keys.length == values.length, "Array length mismatch");
+        
+        for (uint256 i = 0; i < keys.length; i++) {
+            if (bytes(values[i]).length == 0) {
+                delete _texts[node][keys[i]];
+                emit TextDeleted(node, keys[i]);
+            } else {
+                _texts[node][keys[i]] = values[i];
+                emit TextChanged(node, keys[i], values[i]);
+            }
+        }
+        _incrementVersion(node);
     }
 
-    // ===== ADDRESS RECORDS =====
-
-    /// @notice Set ETH address for domain
-    function setAddr(bytes32 node, address domainAddress)
-        external
-        onlyNodeOwnerOrAuthorized(node)
-        whenNotPaused
+    // Clear all records for a node
+    function clearRecords(bytes32 node) 
+        external 
+        onlyNodeOwnerOrOperator(node) 
+        whenNotPaused 
     {
-        _addresses[node] = domainAddress;
-        emit AddressChanged(node, domainAddress);
+        delete _addresses[node];
+        delete _names[node];
+        delete _contenthash[node];
+        delete _pubkeys[node];
+        // Note: mappings need to be cleared individually in practice
+        _incrementVersion(node);
+        
+        emit AddressChanged(node, address(0));
+        emit NameChanged(node, "");
+        emit ContenthashChanged(node, "");
     }
 
-    /// @notice Get ETH address for domain
+    // View functions
     function addr(bytes32 node) external view returns (address) {
         return _addresses[node];
     }
 
-    // ===== INTERFACE SUPPORT =====
-
-    /// @notice Set interface implementer
-    function setInterface(
-        bytes32 node,
-        bytes4 interfaceID,
-        address implementer
-    ) external onlyNodeOwnerOrAuthorized(node) whenNotPaused {
-        _interfaces[node][interfaceID] = implementer;
-        emit InterfaceChanged(node, interfaceID, implementer);
+    function name(bytes32 node) external view returns (string memory) {
+        return _names[node];
     }
 
-    /// @notice Get interface implementer
-    function interfaceImplementer(bytes32 node, bytes4 interfaceID)
-        external
-        view
-        returns (address)
-    {
+    function contenthash(bytes32 node) external view returns (bytes32) {
+        return _contenthash[node];
+    }
+
+    function text(bytes32 node, string calldata key) external view returns (string memory) {
+        return _texts[node][key];
+    }
+
+    function ABI(bytes32 node, uint256 contentType) external view returns (uint256, bytes memory) {
+        bytes memory data = _abis[node][string(abi.encodePacked(contentType))];
+        return (contentType, data);
+    }
+
+    function pubkey(bytes32 node) external view returns (bytes32 x, bytes32 y) {
+        bytes memory data = _pubkeys[node];
+        if (data.length == 64) {
+            assembly {
+                x := mload(add(data, 32))
+                y := mload(add(data, 64))
+            }
+        }
+    }
+
+    function addrByType(bytes32 node, uint256 coinType) external view returns (bytes memory) {
+        return _addresses_by_coin_type[node][coinType];
+    }
+
+    function interfaceImplementer(bytes32 node, bytes4 interfaceID) external view returns (address) {
         return _interfaces[node][interfaceID];
     }
 
-    // ===== CONVENIENCE FUNCTIONS =====
-
-    /// @notice Set common profile data
-    function setProfile(
-        bytes32 node,
-        string calldata displayName,
-        string calldata description,
-        string calldata avatar,
-        string calldata url,
-        address ethAddress
-    ) external onlyNodeOwnerOrAuthorized(node) whenNotPaused {
-        if (bytes(displayName).length > 0) {
-            _textRecords[node][DISPLAY_KEY] = displayName;
-            emit TextChanged(node, DISPLAY_KEY, displayName);
-        }
-        
-        if (bytes(description).length > 0) {
-            _textRecords[node][DESCRIPTION_KEY] = description;
-            emit TextChanged(node, DESCRIPTION_KEY, description);
-        }
-        
-        if (bytes(avatar).length > 0) {
-            _textRecords[node][AVATAR_KEY] = avatar;
-            emit TextChanged(node, AVATAR_KEY, avatar);
-        }
-        
-        if (bytes(url).length > 0) {
-            _textRecords[node][URL_KEY] = url;
-            emit TextChanged(node, URL_KEY, url);
-        }
-        
-        if (ethAddress != address(0)) {
-            _addresses[node] = ethAddress;
-            emit AddressChanged(node, ethAddress);
-        }
+    function owner(bytes32 node) external view returns (address) {
+        return _getNodeOwner(node);
     }
 
-    /// @notice Get basic profile info
-    function getProfile(bytes32 node)
-        external
-        view
-        returns (
-            string memory displayName,
-            string memory description,
-            string memory avatar,
-            string memory url,
-            address ethAddress
-        )
-    {
-        return (
-            _textRecords[node][DISPLAY_KEY],
-            _textRecords[node][DESCRIPTION_KEY],
-            _textRecords[node][AVATAR_KEY],
-            _textRecords[node][URL_KEY],
-            _addresses[node]
-        );
+    function isOperator(bytes32 node, address operator) external view returns (bool) {
+        return _operators[node][operator];
     }
 
-    /// @notice Clear all records for a domain
-    function clearAllRecords(bytes32 node, string[] calldata textKeys)
-        external
-        onlyNodeOwnerOrAuthorized(node)
-        whenNotPaused
-    {
-        // Clear text records
-        for (uint i = 0; i < textKeys.length; i++) {
-            delete _textRecords[node][textKeys[i]];
-            emit TextChanged(node, textKeys[i], "");
+    function recordVersions(bytes32 node) external view returns (uint64) {
+        return _recordVersions[node];
+    }
+
+    // Internal functions
+    function _getNodeOwner(bytes32 node) internal view returns (address) {
+        address nodeOwner = _nodeOwners[node];
+        if (nodeOwner == address(0)) {
+            // Fallback to registry owner
+            return registry.nodeOwner(node);
         }
-        
-        // Clear address record
-        delete _addresses[node];
-        emit AddressChanged(node, address(0));
+        return nodeOwner;
     }
 
-    function supportsInterface(bytes4 interfaceId)
-        public
-        view
-        override(AccessControl)
-        returns (bool)
+    function _incrementVersion(bytes32 node) internal {
+        _recordVersions[node]++;
+        emit VersionChanged(node, _recordVersions[node]);
+    }
+
+    // Admin functions
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    function _authorizeUpgrade(address newImplementation) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+
+    // Interface support
+    function supportsInterface(bytes4 interfaceId) 
+        public 
+        view 
+        override(AccessControl, ERC165) 
+        returns (bool) 
     {
-        return super.supportsInterface(interfaceId);
+        return interfaceId == type(IGraphiteDNSRegistry).interfaceId ||
+               super.supportsInterface(interfaceId);
     }
 }

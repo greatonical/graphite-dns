@@ -1,408 +1,661 @@
+// test/ReverseRegistrar.test.ts
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import type { GraphiteDNSRegistry, GraphiteResolver, ReverseRegistrar } from "../typechain";
-import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
+import { time, loadFixture } from "@nomicfoundation/hardhat-network-helpers";
+import type { GraphiteDNSRegistry, ReverseRegistrar } from "../typechain-types";
 
-describe("ReverseRegistrar - Fixed Version", function () {
-  let registry: GraphiteDNSRegistry;
-  let resolver: GraphiteResolver;
-  let reverse: ReverseRegistrar;
-  let owner: SignerWithAddress;
-  let user1: SignerWithAddress;
-  let user2: SignerWithAddress;
-  let unauthorized: SignerWithAddress;
+describe("ReverseRegistrar", function () {
+  const ZERO_ADDRESS = ethers.ZeroAddress;
+  const oneYear = 365 * 24 * 60 * 60;
 
-  const oneYear = 365 * 24 * 3600;
+  async function deployReverseFixture() {
+    const [owner, user1, user2, user3, registry] = await ethers.getSigners();
 
-  beforeEach(async function () {
-    [owner, user1, user2, unauthorized] = await ethers.getSigners();
-
-    // Deploy resolver
-    const ResolverFactory = await ethers.getContractFactory("GraphiteResolver");
-    const tempResolver = await ResolverFactory.deploy(ethers.ZeroAddress);
-    
-    // Deploy registry
+    // Deploy actual registry
     const RegistryFactory = await ethers.getContractFactory("GraphiteDNSRegistry");
-    registry = await RegistryFactory.deploy(await tempResolver.getAddress());
-    
-    // Deploy final resolver
-    resolver = await ResolverFactory.deploy(await registry.getAddress());
-    
+    const actualRegistry = await RegistryFactory.deploy(ZERO_ADDRESS, "atgraphite");
+
     // Deploy reverse registrar
     const ReverseFactory = await ethers.getContractFactory("ReverseRegistrar");
-    reverse = await ReverseFactory.deploy(await registry.getAddress());
+    const reverse = await ReverseFactory.deploy(await actualRegistry.getAddress());
 
-    // Register some test domains
-    const price1 = await registry["priceOf(string,uint64)"]("user1domain", oneYear);
-    await registry.connect(user1).buyFixedPrice(
-      "user1domain",
-      await resolver.getAddress(),
+    // Setup roles
+    const registryRole = await reverse.REGISTRY_ROLE();
+    const managerRole = await reverse.MANAGER_ROLE();
+    
+    await reverse.grantRole(registryRole, await actualRegistry.getAddress());
+    await reverse.grantRole(managerRole, owner.address);
+
+    return {
+      registry: actualRegistry,
+      reverse,
+      owner,
+      user1,
+      user2,
+      user3,
+      registryRole,
+      managerRole
+    };
+  }
+
+  async function registeredDomainFixture() {
+    const base = await loadFixture(deployReverseFixture);
+    const { registry, reverse, user1 } = base;
+
+    // Grant registrar role to owner for testing
+    const registrarRole = await registry.REGISTRAR_ROLE();
+    await registry.grantRole(registrarRole, base.owner.address);
+
+    // Register a domain
+    const TLD_NODE = await registry.TLD_NODE();
+    const price = await registry.priceOf("alice");
+    await registry.register(
+      "alice",
+      user1.address,
       oneYear,
-      { value: price1 }
+      ZERO_ADDRESS,
+      TLD_NODE,
+      { value: price }
     );
 
-    const price2 = await registry["priceOf(string,uint64)"]("user1second", oneYear);
-    await registry.connect(user1).buyFixedPrice(
-      "user1second",
-      await resolver.getAddress(),
-      oneYear,
-      { value: price2 }
-    );
+    const node = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"],
+      [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("alice"))]));
 
-    const price3 = await registry["priceOf(string,uint64)"]("user2domain", oneYear);
-    await registry.connect(user2).buyFixedPrice(
-      "user2domain",
-      await resolver.getAddress(),
-      oneYear,
-      { value: price3 }
-    );
-  });
+    // Set up reverse registrar integration
+    await registry.setReverseRegistrar(await reverse.getAddress());
+    const registryRole = await reverse.REGISTRY_ROLE();
+    await reverse.grantRole(registryRole, await registry.getAddress());
 
-  describe("Primary Name Management", function () {
-    it("Should allow domain owner to set primary name", async function () {
-      await expect(
-        reverse.connect(user1).setPrimaryName("user1domain")
-      ).to.emit(reverse, "PrimaryNameSet")
-       .withArgs(user1.address, "user1domain")
-       .and.to.emit(reverse, "NameAdded")
-       .withArgs(user1.address, "user1domain");
+    return { ...base, node, TLD_NODE };
+  }
 
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
+  describe("Deployment", function () {
+    it("Should deploy with correct registry reference", async function () {
+      const { reverse, registry } = await loadFixture(deployReverseFixture);
+
+      expect(await reverse.registry()).to.equal(await registry.getAddress());
     });
 
-    it("Should reject setting primary name for non-owned domain", async function () {
-      await expect(
-        reverse.connect(user1).setPrimaryName("user2domain")
-      ).to.be.revertedWith("Not domain owner");
+    it("Should set default settings", async function () {
+      const { reverse } = await loadFixture(deployReverseFixture);
+
+      expect(await reverse.requireOwnership()).to.be.true;
+      expect(await reverse.autoManagement()).to.be.true;
     });
 
-    it("Should reject setting primary name for non-existent domain", async function () {
-      await expect(
-        reverse.connect(user1).setPrimaryName("nonexistent")
-      ).to.be.revertedWith("Domain not found");
-    });
+    it("Should grant correct initial roles", async function () {
+      const { reverse, owner, registry } = await loadFixture(deployReverseFixture);
 
-    it("Should reject setting primary name for expired domain", async function () {
-      // Fast forward past domain expiry
-      await ethers.provider.send("evm_increaseTime", [oneYear + 1]);
-      await ethers.provider.send("evm_mine", []);
+      const adminRole = await reverse.DEFAULT_ADMIN_ROLE();
+      const managerRole = await reverse.MANAGER_ROLE();
+      const registryRole = await reverse.REGISTRY_ROLE();
 
-      await expect(
-        reverse.connect(user1).setPrimaryName("user1domain")
-      ).to.be.revertedWith("Domain expired");
-    });
-
-    it("Should allow clearing primary name", async function () {
-      await reverse.connect(user1).setPrimaryName("user1domain");
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
-
-      await expect(
-        reverse.connect(user1).clearPrimaryName()
-      ).to.emit(reverse, "PrimaryNameSet")
-       .withArgs(user1.address, "");
-
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("");
-    });
-
-    it("Should update primary name when switching between owned domains", async function () {
-      await reverse.connect(user1).setPrimaryName("user1domain");
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
-
-      await reverse.connect(user1).setPrimaryName("user1second");
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1second");
-    });
-
-    it("Should support legacy getReverse function", async function () {
-      await reverse.connect(user1).setPrimaryName("user1domain");
-      expect(await reverse.getReverse(user1.address)).to.equal("user1domain");
+      expect(await reverse.hasRole(adminRole, owner.address)).to.be.true;
+      expect(await reverse.hasRole(managerRole, owner.address)).to.be.true;
+      expect(await reverse.hasRole(registryRole, await registry.getAddress())).to.be.true;
     });
   });
 
-  describe("Owned Names Management", function () {
-    it("Should automatically add domain to owned list when setting primary", async function () {
-      await reverse.connect(user1).setPrimaryName("user1domain");
-      
-      const ownedNames = await reverse.getOwnedNames(user1.address);
-      expect(ownedNames).to.include("user1domain");
-      expect(await reverse.getOwnedNameCount(user1.address)).to.equal(1);
-      expect(await reverse.ownsNameInReverse(user1.address, "user1domain")).to.be.true;
+  describe("Manual Reverse Record Management", function () {
+    it("Should allow user to set reverse record", async function () {
+      const { reverse, user1 } = await loadFixture(deployReverseFixture);
+
+      // Disable ownership requirement for this test
+      await reverse.setOwnershipRequirement(false);
+
+      await expect(
+        reverse.connect(user1).setName("alice.atgraphite")
+      ).to.emit(reverse, "NameSet")
+       .withArgs(user1.address, "alice.atgraphite");
+
+      expect(await reverse.name(user1.address)).to.equal("alice.atgraphite");
     });
 
-    it("Should allow manually adding owned names", async function () {
+    it("Should allow user to clear reverse record", async function () {
+      const { reverse, user1 } = await loadFixture(deployReverseFixture);
+
+      await reverse.setOwnershipRequirement(false);
+      await reverse.connect(user1).setName("alice.atgraphite");
+
       await expect(
-        reverse.connect(user1).addOwnedName("user1domain")
+        reverse.connect(user1).clearName()
+      ).to.emit(reverse, "NameCleared")
+       .withArgs(user1.address);
+
+      expect(await reverse.name(user1.address)).to.equal("");
+    });
+
+    it("Should validate name length", async function () {
+      const { reverse, user1 } = await loadFixture(deployReverseFixture);
+
+      await reverse.setOwnershipRequirement(false);
+
+      // Empty name
+      await expect(
+        reverse.connect(user1).setName("")
+      ).to.be.revertedWith("Empty name");
+
+      // Too long name
+      const longName = "a".repeat(256);
+      await expect(
+        reverse.connect(user1).setName(longName)
+      ).to.be.revertedWith("Name too long");
+    });
+
+    it("Should enforce ownership when required", async function () {
+      const { reverse, user1 } = await loadFixture(deployReverseFixture);
+
+      // Ownership requirement is true by default
+      await expect(
+        reverse.connect(user1).setName("unowned.atgraphite")
+      ).to.be.revertedWith("Not name owner");
+    });
+
+    it("Should allow setting reverse record when user owns domain", async function () {
+      const { reverse, user1 } = await loadFixture(registeredDomainFixture);
+
+      await expect(
+        reverse.connect(user1).setName("alice.atgraphite")
+      ).to.emit(reverse, "NameSet")
+       .withArgs(user1.address, "alice.atgraphite");
+    });
+  });
+
+  describe("Automatic Reverse Record Management", function () {
+    it("Should allow registry to set reverse record", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      await expect(
+        reverse.connect(registry).setNameForAddr(user1.address, "alice.atgraphite")
+      ).to.emit(reverse, "NameSet")
+       .withArgs(user1.address, "alice.atgraphite");
+
+      expect(await reverse.name(user1.address)).to.equal("alice.atgraphite");
+    });
+
+    it("Should allow registry to clear reverse record", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      // Set record first
+      await reverse.connect(registry).setNameForAddr(user1.address, "alice.atgraphite");
+
+      // Clear record
+      await expect(
+        reverse.connect(registry).clearNameForAddr(user1.address)
+      ).to.emit(reverse, "NameCleared")
+       .withArgs(user1.address);
+
+      expect(await reverse.name(user1.address)).to.equal("");
+    });
+
+    it("Should prevent non-registry from auto-setting", async function () {
+      const { reverse, user1, user2 } = await loadFixture(deployReverseFixture);
+
+      await expect(
+        reverse.connect(user1).setNameForAddr(user2.address, "hack.atgraphite")
+      ).to.be.revertedWith("AccessControl:");
+    });
+
+    it("Should support batch operations", async function () {
+      const { reverse, registry, user1, user2 } = await loadFixture(deployReverseFixture);
+
+      const addresses = [user1.address, user2.address];
+      const names = ["alice.atgraphite", "bob.atgraphite"];
+
+      await expect(
+        reverse.connect(registry).setMultipleNames(addresses, names)
+      ).to.not.be.reverted;
+
+      expect(await reverse.name(user1.address)).to.equal("alice.atgraphite");
+      expect(await reverse.name(user2.address)).to.equal("bob.atgraphite");
+    });
+
+    it("Should handle empty names in batch operations as clears", async function () {
+      const { reverse, registry, user1, user2 } = await loadFixture(deployReverseFixture);
+
+      // Set some names first
+      await reverse.connect(registry).setNameForAddr(user1.address, "alice.atgraphite");
+      await reverse.connect(registry).setNameForAddr(user2.address, "bob.atgraphite");
+
+      // Batch update with empty name (clear)
+      const addresses = [user1.address, user2.address];
+      const names = ["", "bobby.atgraphite"]; // Empty = clear
+
+      await reverse.connect(registry).setMultipleNames(addresses, names);
+
+      expect(await reverse.name(user1.address)).to.equal(""); // Cleared
+      expect(await reverse.name(user2.address)).to.equal("bobby.atgraphite"); // Updated
+    });
+
+    it("Should validate batch operation array lengths", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      const addresses = [user1.address];
+      const names = ["alice.atgraphite", "extra.atgraphite"]; // Mismatched length
+
+      await expect(
+        reverse.connect(registry).setMultipleNames(addresses, names)
+      ).to.be.revertedWith("Array length mismatch");
+    });
+  });
+
+  describe("Ownership Tracking", function () {
+    it("Should track owned names", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      await expect(
+        reverse.connect(registry).addOwnedName(user1.address, "alice.atgraphite")
       ).to.emit(reverse, "NameAdded")
-       .withArgs(user1.address, "user1domain");
+       .withArgs(user1.address, "alice.atgraphite");
 
-      expect(await reverse.ownsNameInReverse(user1.address, "user1domain")).to.be.true;
-    });
-
-    it("Should prevent adding non-owned domains", async function () {
-      await expect(
-        reverse.connect(user1).addOwnedName("user2domain")
-      ).to.be.revertedWith("Not domain owner");
-    });
-
-    it("Should prevent adding already added domains", async function () {
-      await reverse.connect(user1).addOwnedName("user1domain");
+      expect(await reverse.ownsName(user1.address, "alice.atgraphite")).to.be.true;
       
-      await expect(
-        reverse.connect(user1).addOwnedName("user1domain")
-      ).to.be.revertedWith("Already added");
+      const ownedNames = await reverse.getOwnedNames(user1.address);
+      expect(ownedNames).to.include("alice.atgraphite");
     });
 
-    it("Should allow removing owned names", async function () {
-      await reverse.connect(user1).addOwnedName("user1domain");
-      await reverse.connect(user1).addOwnedName("user1second");
-      
-      expect(await reverse.getOwnedNameCount(user1.address)).to.equal(2);
+    it("Should remove owned names", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
 
+      // Add name first
+      await reverse.connect(registry).addOwnedName(user1.address, "alice.atgraphite");
+
+      // Remove name
       await expect(
-        reverse.connect(user1).removeOwnedName("user1domain")
+        reverse.connect(registry).removeOwnedName(user1.address, "alice.atgraphite")
       ).to.emit(reverse, "NameRemoved")
-       .withArgs(user1.address, "user1domain");
+       .withArgs(user1.address, "alice.atgraphite");
 
-      expect(await reverse.getOwnedNameCount(user1.address)).to.equal(1);
-      expect(await reverse.ownsNameInReverse(user1.address, "user1domain")).to.be.false;
-      expect(await reverse.ownsNameInReverse(user1.address, "user1second")).to.be.true;
+      expect(await reverse.ownsName(user1.address, "alice.atgraphite")).to.be.false;
+      
+      const ownedNames = await reverse.getOwnedNames(user1.address);
+      expect(ownedNames).to.not.include("alice.atgraphite");
     });
 
-    it("Should clear primary name when removing it from owned list", async function () {
-      await reverse.connect(user1).setPrimaryName("user1domain");
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
+    it("Should clear reverse record when removing primary name", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
 
-      await expect(
-        reverse.connect(user1).removeOwnedName("user1domain")
-      ).to.emit(reverse, "PrimaryNameSet")
-       .withArgs(user1.address, "");
+      // Set as primary reverse record
+      await reverse.connect(registry).setNameForAddr(user1.address, "alice.atgraphite");
+      await reverse.connect(registry).addOwnedName(user1.address, "alice.atgraphite");
 
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("");
+      // Remove the name
+      await reverse.connect(registry).removeOwnedName(user1.address, "alice.atgraphite");
+
+      // Primary reverse record should be cleared
+      expect(await reverse.name(user1.address)).to.equal("");
     });
 
-    it("Should not affect primary name when removing non-primary owned name", async function () {
-      await reverse.connect(user1).setPrimaryName("user1domain");
-      await reverse.connect(user1).addOwnedName("user1second");
+    it("Should track multiple owned names", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
 
-      await reverse.connect(user1).removeOwnedName("user1second");
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
-    });
+      const names = ["alice.atgraphite", "alice2.atgraphite", "alice3.atgraphite"];
 
-    it("Should get all owned names", async function () {
-      await reverse.connect(user1).addOwnedName("user1domain");
-      await reverse.connect(user1).addOwnedName("user1second");
+      for (const name of names) {
+        await reverse.connect(registry).addOwnedName(user1.address, name);
+      }
 
       const ownedNames = await reverse.getOwnedNames(user1.address);
-      expect(ownedNames).to.have.lengthOf(2);
-      expect(ownedNames).to.include("user1domain");
-      expect(ownedNames).to.include("user1second");
+      expect(ownedNames.length).to.equal(3);
+      for (const name of names) {
+        expect(ownedNames).to.include(name);
+      }
+
+      expect(await reverse.nameCount(user1.address)).to.equal(3);
+    });
+
+    it("Should prevent duplicate name additions", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      await reverse.connect(registry).addOwnedName(user1.address, "alice.atgraphite");
+
+      // Adding same name again should not emit event or change state
+      const tx = await reverse.connect(registry).addOwnedName(user1.address, "alice.atgraphite");
+      const receipt = await tx.wait();
+      
+      // Should not emit NameAdded event again
+      const events = receipt!.logs.filter(log => {
+        try {
+          return reverse.interface.parseLog(log)?.name === "NameAdded";
+        } catch {
+          return false;
+        }
+      });
+      expect(events.length).to.equal(0);
     });
   });
 
-  describe("Admin Functions", function () {
-    it("Should allow admin to set reverse for any address", async function () {
-      const reverseRole = await reverse.REVERSE_ROLE();
-      await reverse.grantRole(reverseRole, owner.address);
+  describe("Administrative Management", function () {
+    it("Should allow manager to set names", async function () {
+      const { reverse, owner, user1 } = await loadFixture(deployReverseFixture);
 
       await expect(
-        reverse.setReverseFor(user1.address, "user1domain")
-      ).to.emit(reverse, "PrimaryNameSet")
-       .withArgs(user1.address, "user1domain");
+        reverse.connect(owner).adminSetName(user1.address, "admin.atgraphite")
+      ).to.emit(reverse, "NameSet")
+       .withArgs(user1.address, "admin.atgraphite");
 
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
+      expect(await reverse.name(user1.address)).to.equal("admin.atgraphite");
     });
 
-    it("Should validate domain exists when admin sets reverse", async function () {
-      const reverseRole = await reverse.REVERSE_ROLE();
-      await reverse.grantRole(reverseRole, owner.address);
+    it("Should allow manager to clear names", async function () {
+      const { reverse, owner, user1 } = await loadFixture(deployReverseFixture);
 
-      // Should work with existing domain
-      await reverse.setReverseFor(user1.address, "user1domain");
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
+      await reverse.connect(owner).adminSetName(user1.address, "admin.atgraphite");
 
-      // Should allow empty name
-      await reverse.setReverseFor(user1.address, "");
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("");
-    });
-
-    it("Should reject admin functions from unauthorized users", async function () {
       await expect(
-        reverse.connect(unauthorized).setReverseFor(user1.address, "user1domain")
-      ).to.be.reverted;
+        reverse.connect(owner).adminClearName(user1.address)
+      ).to.emit(reverse, "NameCleared")
+       .withArgs(user1.address);
+
+      expect(await reverse.name(user1.address)).to.equal("");
     });
 
-    it("Should support legacy setReverse admin function", async function () {
-      const reverseRole = await reverse.REVERSE_ROLE();
-      await reverse.grantRole(reverseRole, owner.address);
+    it("Should prevent non-manager from admin functions", async function () {
+      const { reverse, user1, user2 } = await loadFixture(deployReverseFixture);
 
-      await reverse.setReverse("user1domain");
-      expect(await reverse.getPrimaryName(owner.address)).to.equal("user1domain");
+      await expect(
+        reverse.connect(user1).adminSetName(user2.address, "unauthorized.atgraphite")
+      ).to.be.revertedWith("AccessControl:");
+
+      await expect(
+        reverse.connect(user1).adminClearName(user2.address)
+      ).to.be.revertedWith("AccessControl:");
     });
   });
 
-  describe("Sync Functionality", function () {
-    it("Should sync owned names with registry state", async function () {
-      // Add names to reverse registrar
-      await reverse.connect(user1).addOwnedName("user1domain");
-      await reverse.connect(user1).addOwnedName("user1second");
-      await reverse.connect(user1).setPrimaryName("user1domain");
+  describe("Settings Management", function () {
+    it("Should allow admin to change ownership requirement", async function () {
+      const { reverse, owner } = await loadFixture(deployReverseFixture);
 
-      // Transfer one domain to another user
-      const tokenId = await registry.getTokenOfNode(
-        await registry.getNodeOfLabel("user1domain")
-      );
-      await registry.connect(user1).transferFrom(
-        user1.address,
-        user2.address,
-        tokenId
-      );
+      await expect(
+        reverse.setOwnershipRequirement(false)
+      ).to.emit(reverse, "OwnershipRequirementChanged")
+       .withArgs(false);
 
-      // Sync should remove transferred domain
-      await reverse.syncOwnedNames(user1.address);
-
-      expect(await reverse.ownsNameInReverse(user1.address, "user1domain")).to.be.false;
-      expect(await reverse.ownsNameInReverse(user1.address, "user1second")).to.be.true;
-      expect(await reverse.getPrimaryName(user1.address)).to.equal(""); // Should clear primary
+      expect(await reverse.requireOwnership()).to.be.false;
     });
 
-    it("Should handle expired domains in sync", async function () {
-      await reverse.connect(user1).addOwnedName("user1domain");
-      await reverse.connect(user1).setPrimaryName("user1domain");
+    it("Should allow admin to change auto-management setting", async function () {
+      const { reverse, owner } = await loadFixture(deployReverseFixture);
 
-      // Fast forward past expiry
-      await ethers.provider.send("evm_increaseTime", [oneYear + 1]);
-      await ethers.provider.send("evm_mine", []);
+      await expect(
+        reverse.setAutoManagement(false)
+      ).to.emit(reverse, "AutoManagementChanged")
+       .withArgs(false);
 
-      await reverse.syncOwnedNames(user1.address);
-
-      expect(await reverse.ownsNameInReverse(user1.address, "user1domain")).to.be.false;
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("");
+      expect(await reverse.autoManagement()).to.be.false;
     });
 
-    it("Should allow anyone to call sync for any address", async function () {
-      await reverse.connect(user1).addOwnedName("user1domain");
+    it("Should prevent non-admin from changing settings", async function () {
+      const { reverse, user1 } = await loadFixture(deployReverseFixture);
 
-      // unauthorized user should be able to call sync
-      await reverse.connect(unauthorized).syncOwnedNames(user1.address);
+      await expect(
+        reverse.connect(user1).setOwnershipRequirement(false)
+      ).to.be.revertedWith("AccessControl:");
+
+      await expect(
+        reverse.connect(user1).setAutoManagement(false)
+      ).to.be.revertedWith("AccessControl:");
     });
   });
 
-  describe("Multi-User Scenarios", function () {
-    it("Should handle multiple users with different domains", async function () {
-      await reverse.connect(user1).setPrimaryName("user1domain");
-      await reverse.connect(user2).setPrimaryName("user2domain");
+  describe("Validation Functions", function () {
+    it("Should validate reverse claims correctly", async function () {
+      const { reverse, user1 } = await loadFixture(registeredDomainFixture);
 
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
-      expect(await reverse.getPrimaryName(user2.address)).to.equal("user2domain");
+      // Valid claim (user owns the domain)
+      let [valid, reason] = await reverse.validateReverseClaim(user1.address, "alice.atgraphite");
+      expect(valid).to.be.true;
+      expect(reason).to.equal("");
 
-      const user1Names = await reverse.getOwnedNames(user1.address);
-      const user2Names = await reverse.getOwnedNames(user2.address);
-
-      expect(user1Names).to.include("user1domain");
-      expect(user2Names).to.include("user2domain");
-      expect(user1Names).to.not.include("user2domain");
-      expect(user2Names).to.not.include("user1domain");
+      // Invalid claim (user doesn't own domain)
+      [valid, reason] = await reverse.validateReverseClaim(user1.address, "notowned.atgraphite");
+      expect(valid).to.be.false;
+      expect(reason).to.equal("Not name owner");
     });
 
-    it("Should handle domain transfers between users", async function () {
-      await reverse.connect(user1).setPrimaryName("user1domain");
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
+    it("Should handle non-existent domains in validation", async function () {
+      const { reverse, user1 } = await loadFixture(deployReverseFixture);
 
-      // Transfer domain
-      const tokenId = await registry.getTokenOfNode(
-        await registry.getNodeOfLabel("user1domain")
-      );
-      await registry.connect(user1).transferFrom(
-        user1.address,
-        user2.address,
-        tokenId
-      );
+      const [valid, reason] = await reverse.validateReverseClaim(user1.address, "nonexistent.atgraphite");
+      expect(valid).to.be.false;
+      expect(reason).to.equal("Name does not exist");
+    });
 
-      // user2 should now be able to set it as primary
-      await reverse.connect(user2).setPrimaryName("user1domain");
-      expect(await reverse.getPrimaryName(user2.address)).to.equal("user1domain");
+    it("Should bypass validation when ownership not required", async function () {
+      const { reverse, user1 } = await loadFixture(deployReverseFixture);
 
-      // user1 should no longer be able to set it
+      await reverse.setOwnershipRequirement(false);
+
+      const [valid, reason] = await reverse.validateReverseClaim(user1.address, "anything.atgraphite");
+      expect(valid).to.be.true;
+      expect(reason).to.equal("");
+    });
+  });
+
+  describe("Auto-Management Behavior", function () {
+    it("Should auto-add names when auto-management is enabled", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      expect(await reverse.autoManagement()).to.be.true;
+
+      // When registry sets name, should auto-add to owned names
+      await reverse.connect(registry).setNameForAddr(user1.address, "auto.atgraphite");
+
+      expect(await reverse.ownsName(user1.address, "auto.atgraphite")).to.be.true;
+      expect(await reverse.getNameOwner("auto.atgraphite")).to.equal(user1.address);
+    });
+
+    it("Should not auto-add names when auto-management is disabled", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      await reverse.setAutoManagement(false);
+
+      await reverse.connect(registry).setNameForAddr(user1.address, "manual.atgraphite");
+
+      // Should not be automatically added to owned names
+      expect(await reverse.ownsName(user1.address, "manual.atgraphite")).to.be.false;
+    });
+
+    it("Should clear old name mapping when setting new name", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      // Set first name
+      await reverse.connect(registry).setNameForAddr(user1.address, "first.atgraphite");
+      expect(await reverse.getNameOwner("first.atgraphite")).to.equal(user1.address);
+
+      // Set second name (should clear first mapping)
+      await reverse.connect(registry).setNameForAddr(user1.address, "second.atgraphite");
+      expect(await reverse.getNameOwner("first.atgraphite")).to.equal(ZERO_ADDRESS);
+      expect(await reverse.getNameOwner("second.atgraphite")).to.equal(user1.address);
+    });
+  });
+
+  describe("View Functions", function () {
+    it("Should return correct name for address", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      await reverse.connect(registry).setNameForAddr(user1.address, "test.atgraphite");
+      expect(await reverse.name(user1.address)).to.equal("test.atgraphite");
+    });
+
+    it("Should return empty string for address with no name", async function () {
+      const { reverse, user1 } = await loadFixture(deployReverseFixture);
+
+      expect(await reverse.name(user1.address)).to.equal("");
+    });
+
+    it("Should return correct owned names list", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      const names = ["alice.atgraphite", "bob.atgraphite"];
+      for (const name of names) {
+        await reverse.connect(registry).addOwnedName(user1.address, name);
+      }
+
+      const ownedNames = await reverse.getOwnedNames(user1.address);
+      expect(ownedNames.length).to.equal(2);
+      expect(ownedNames).to.include("alice.atgraphite");
+      expect(ownedNames).to.include("bob.atgraphite");
+    });
+
+    it("Should return correct name count", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      expect(await reverse.nameCount(user1.address)).to.equal(0);
+
+      await reverse.connect(registry).addOwnedName(user1.address, "first.atgraphite");
+      expect(await reverse.nameCount(user1.address)).to.equal(1);
+
+      await reverse.connect(registry).addOwnedName(user1.address, "second.atgraphite");
+      expect(await reverse.nameCount(user1.address)).to.equal(2);
+    });
+
+    it("Should return correct name owner", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      await reverse.connect(registry).addOwnedName(user1.address, "owned.atgraphite");
+      expect(await reverse.getNameOwner("owned.atgraphite")).to.equal(user1.address);
+
+      expect(await reverse.getNameOwner("unowned.atgraphite")).to.equal(ZERO_ADDRESS);
+    });
+
+    it("Should correctly report if address has name", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      expect(await reverse.hasName(user1.address)).to.be.false;
+
+      await reverse.connect(registry).setNameForAddr(user1.address, "test.atgraphite");
+      expect(await reverse.hasName(user1.address)).to.be.true;
+    });
+  });
+
+  describe("Access Control", function () {
+    it("Should allow admin to pause contract", async function () {
+      const { reverse, owner } = await loadFixture(deployReverseFixture);
+
+      await expect(reverse.pause()).to.emit(reverse, "Paused");
+      expect(await reverse.paused()).to.be.true;
+    });
+
+    it("Should prevent operations when paused", async function () {
+      const { reverse, owner, user1 } = await loadFixture(deployReverseFixture);
+
+      await reverse.pause();
+
       await expect(
-        reverse.connect(user1).setPrimaryName("user1domain")
-      ).to.be.revertedWith("Not domain owner");
+        reverse.connect(user1).setName("paused.atgraphite")
+      ).to.be.revertedWith("Pausable: paused");
+    });
+
+    it("Should allow unpausing", async function () {
+      const { reverse, owner } = await loadFixture(deployReverseFixture);
+
+      await reverse.pause();
+      await expect(reverse.unpause()).to.emit(reverse, "Unpaused");
+      expect(await reverse.paused()).to.be.false;
     });
   });
 
   describe("Edge Cases", function () {
-    it("Should handle empty strings gracefully", async function () {
-      expect(await reverse.getPrimaryName(unauthorized.address)).to.equal("");
-      expect(await reverse.getOwnedNames(unauthorized.address)).to.have.lengthOf(0);
-      expect(await reverse.getOwnedNameCount(unauthorized.address)).to.equal(0);
+    it("Should handle maximum length names", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      const maxName = "a".repeat(255);
+      await expect(
+        reverse.connect(registry).setNameForAddr(user1.address, maxName)
+      ).to.not.be.reverted;
+
+      expect(await reverse.name(user1.address)).to.equal(maxName);
     });
 
-    it("Should handle addresses with no domains", async function () {
-      expect(await reverse.ownsNameInReverse(unauthorized.address, "user1domain")).to.be.false;
+    it("Should handle special characters in names", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      const specialName = "test-domain.sub.atgraphite";
+      await reverse.connect(registry).setNameForAddr(user1.address, specialName);
+      expect(await reverse.name(user1.address)).to.equal(specialName);
+    });
+
+    it("Should handle removing non-existent owned name", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      // Try to remove name that was never added
+      await expect(
+        reverse.connect(registry).removeOwnedName(user1.address, "never-added.atgraphite")
+      ).to.not.be.reverted;
+
+      // Should not emit any events
+      const tx = await reverse.connect(registry).removeOwnedName(user1.address, "never-added.atgraphite");
+      const receipt = await tx.wait();
       
-      const ownedNames = await reverse.getOwnedNames(unauthorized.address);
-      expect(ownedNames).to.have.lengthOf(0);
+      const events = receipt!.logs.filter(log => {
+        try {
+          return reverse.interface.parseLog(log)?.name === "NameRemoved";
+        } catch {
+          return false;
+        }
+      });
+      expect(events.length).to.equal(0);
     });
 
-    it("Should handle very long domain names", async function () {
-      // Register a domain with maximum length name
-      const longName = "a".repeat(32); // MAX_NAME_LENGTH
-      const price = await registry["priceOf(string,uint64)"](longName, oneYear);
-      await registry.connect(user1).buyFixedPrice(
-        longName,
-        await resolver.getAddress(),
-        oneYear,
-        { value: price }
-      );
-
-      await reverse.connect(user1).setPrimaryName(longName);
-      expect(await reverse.getPrimaryName(user1.address)).to.equal(longName);
-    });
-
-    it("Should prevent setting primary name with empty string", async function () {
-      await expect(
-        reverse.connect(user1).setPrimaryName("")
-      ).to.be.revertedWith("Empty name");
-    });
-  });
-
-  describe("Pausing Functionality", function () {
-    it("Should allow pausing and unpausing", async function () {
-      await reverse.pause();
-      expect(await reverse.paused()).to.be.true;
+    it("Should handle clearing name when no name is set", async function () {
+      const { reverse, user1 } = await loadFixture(deployReverseFixture);
 
       await expect(
-        reverse.connect(user1).setPrimaryName("user1domain")
-      ).to.be.revertedWith("Pausable: paused");
+        reverse.connect(user1).clearName()
+      ).to.emit(reverse, "NameCleared")
+       .withArgs(user1.address);
 
-      await reverse.unpause();
-      expect(await reverse.paused()).to.be.false;
-
-      // Should work after unpausing
-      await reverse.connect(user1).setPrimaryName("user1domain");
-      expect(await reverse.getPrimaryName(user1.address)).to.equal("user1domain");
-    });
-
-    it("Should restrict pause functions to admin", async function () {
-      await expect(
-        reverse.connect(unauthorized).pause()
-      ).to.be.reverted;
-
-      await expect(
-        reverse.connect(unauthorized).unpause()
-      ).to.be.reverted;
+      expect(await reverse.name(user1.address)).to.equal("");
     });
   });
 
   describe("Gas Optimization", function () {
-    it("Should efficiently handle multiple domain management", async function () {
-      // Add multiple domains
-      await reverse.connect(user1).addOwnedName("user1domain");
-      await reverse.connect(user1).addOwnedName("user1second");
-      
-      const tx = await reverse.connect(user1).setPrimaryName("user1domain");
+    it("Should be gas efficient for single name operations", async function () {
+      const { reverse, registry, user1 } = await loadFixture(deployReverseFixture);
+
+      const tx = await reverse.connect(registry).setNameForAddr(user1.address, "gas-test.atgraphite");
       const receipt = await tx.wait();
-      
-      // Should be reasonably efficient
-      expect(receipt!.gasUsed).to.be.lt(ethers.parseUnits("100000", "wei"));
+
+      expect(receipt!.gasUsed).to.be.lt(100000);
+    });
+
+    it("Should be efficient for batch operations", async function () {
+      const { reverse, registry, user1, user2, user3 } = await loadFixture(deployReverseFixture);
+
+      const addresses = [user1.address, user2.address, user3.address];
+      const names = ["batch1.atgraphite", "batch2.atgraphite", "batch3.atgraphite"];
+
+      const tx = await reverse.connect(registry).setMultipleNames(addresses, names);
+      const receipt = await tx.wait();
+
+      // Should be more efficient than 3 individual calls
+      expect(receipt!.gasUsed).to.be.lt(250000);
+    });
+  });
+
+  describe("Integration Tests", function () {
+    it("Should integrate properly with registry for automatic management", async function () {
+      const { registry, reverse, user1, TLD_NODE } = await loadFixture(registeredDomainFixture);
+
+      // Registry should have automatically set reverse record
+      expect(await reverse.name(user1.address)).to.equal("alice.atgraphite");
+
+      // Should track ownership
+      expect(await reverse.ownsName(user1.address, "alice.atgraphite")).to.be.true;
+    });
+
+    it("Should handle domain transfers with reverse record updates", async function () {
+      const { registry, reverse, user1, user2, node } = await loadFixture(registeredDomainFixture);
+
+      // Transfer domain
+      const tokenId = 2; // Second token (first is TLD)
+      await registry.connect(user1).transferFrom(user1.address, user2.address, tokenId);
+
+      // Reverse records should be updated
+      expect(await reverse.name(user1.address)).to.equal("");
+      expect(await reverse.name(user2.address)).to.equal("alice.atgraphite");
     });
   });
 });

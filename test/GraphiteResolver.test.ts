@@ -1,420 +1,542 @@
+// test/GraphiteResolver.test.ts
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import type { GraphiteDNSRegistry, GraphiteResolver } from "../typechain";
-import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
+import { time, loadFixture } from "@nomicfoundation/hardhat-network-helpers";
+import type { GraphiteDNSRegistry, GraphiteResolver } from "../typechain-types";
 
-describe("GraphiteResolver - Fixed Version", function () {
-  let registry: GraphiteDNSRegistry;
-  let resolver: GraphiteResolver;
-  let owner: SignerWithAddress;
-  let domainOwner: SignerWithAddress;
-  let unauthorized: SignerWithAddress;
+describe("GraphiteResolver", function () {
+  const ZERO_ADDRESS = ethers.ZeroAddress;
+  const oneYear = 365 * 24 * 60 * 60;
 
-  const oneYear = 365 * 24 * 3600;
-  let domainNode: string;
+  async function deployResolverFixture() {
+    const [owner, user1, user2, user3, operator] = await ethers.getSigners();
 
-  beforeEach(async function () {
-    [owner, domainOwner, unauthorized] = await ethers.getSigners();
+    // Deploy registry first
+    const RegistryFactory = await ethers.getContractFactory("GraphiteDNSRegistry");
+    const registry = await RegistryFactory.deploy(ZERO_ADDRESS, "atgraphite");
 
     // Deploy resolver
     const ResolverFactory = await ethers.getContractFactory("GraphiteResolver");
-    const tempResolver = await ResolverFactory.deploy(ethers.ZeroAddress);
-    
-    // Deploy registry
-    const RegistryFactory = await ethers.getContractFactory("GraphiteDNSRegistry");
-    registry = await RegistryFactory.deploy(await tempResolver.getAddress());
-    
-    // Deploy final resolver
-    resolver = await ResolverFactory.deploy(await registry.getAddress());
+    const resolver = await ResolverFactory.deploy(await registry.getAddress());
 
-    // Grant RESOLVER_ROLE to resolver contract
-    const resolverRole = await registry.RESOLVER_ROLE();
-    await registry.grantRole(resolverRole, await resolver.getAddress());
+    const TLD_NODE = await registry.TLD_NODE();
 
-    // Register a test domain
-    const price = await registry["priceOf(string,uint64)"]("testdomain", oneYear);
-    await registry.connect(domainOwner).buyFixedPrice(
-      "testdomain",
-      await resolver.getAddress(),
+    return {
+      registry,
+      resolver,
+      owner,
+      user1,
+      user2,
+      user3,
+      operator,
+      TLD_NODE
+    };
+  }
+
+  async function registerDomainFixture() {
+    const base = await loadFixture(deployResolverFixture);
+    const { registry, resolver, user1, TLD_NODE } = base;
+
+    // Grant registrar role to owner for testing
+    const registrarRole = await registry.REGISTRAR_ROLE();
+    await registry.grantRole(registrarRole, base.owner.address);
+
+    const price = await registry.priceOf("alice");
+    await registry.register(
+      "alice",
+      user1.address,
       oneYear,
+      await resolver.getAddress(),
+      TLD_NODE,
       { value: price }
     );
 
-    domainNode = await registry.getNodeOfToken(1n);
+    const node = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], 
+      [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("alice"))]));
+
+    // Set resolver owner
+    await resolver.setOwner(node, user1.address);
+
+    return { ...base, node };
+  }
+
+  describe("Deployment", function () {
+    it("Should deploy with correct registry reference", async function () {
+      const { resolver, registry } = await loadFixture(deployResolverFixture);
+
+      expect(await resolver.registry()).to.equal(await registry.getAddress());
+    });
+
+    it("Should grant admin role to deployer", async function () {
+      const { resolver, owner } = await loadFixture(deployResolverFixture);
+
+      expect(await resolver.hasRole(await resolver.DEFAULT_ADMIN_ROLE(), owner.address)).to.be.true;
+    });
   });
 
-  describe("Access Control", function () {
-    it("Should allow domain owner to set text records", async function () {
-      await expect(
-        resolver.connect(domainOwner).setText(domainNode, "email", "test@example.com")
-      ).to.emit(resolver, "TextChanged")
-       .withArgs(domainNode, "email", "test@example.com");
+  describe("Ownership Management", function () {
+    it("Should allow registry to set owner", async function () {
+      const { resolver, registry, user1, node } = await loadFixture(registerDomainFixture);
 
-      expect(await resolver.text(domainNode, "email")).to.equal("test@example.com");
+      await expect(
+        resolver.connect(registry).setOwner(node, user1.address)
+      ).to.emit(resolver, "OwnerChanged")
+       .withArgs(node, user1.address);
+
+      expect(await resolver.owner(node)).to.equal(user1.address);
     });
 
-    it("Should reject unauthorized users", async function () {
+    it("Should allow current owner to change ownership", async function () {
+      const { resolver, user1, user2, node } = await loadFixture(registerDomainFixture);
+
       await expect(
-        resolver.connect(unauthorized).setText(domainNode, "email", "hack@example.com")
-      ).to.be.revertedWith("Not authorized for this domain");
+        resolver.connect(user1).setOwner(node, user2.address)
+      ).to.emit(resolver, "OwnerChanged")
+       .withArgs(node, user2.address);
+
+      expect(await resolver.owner(node)).to.equal(user2.address);
     });
 
-    it("Should allow admin to set records", async function () {
-      const resolverRole = await resolver.RESOLVER_ROLE();
-      await resolver.grantRole(resolverRole, owner.address);
+    it("Should prevent unauthorized ownership changes", async function () {
+      const { resolver, user2, user3, node } = await loadFixture(registerDomainFixture);
 
       await expect(
-        resolver.connect(owner).setText(domainNode, "admin", "set by admin")
-      ).to.emit(resolver, "TextChanged");
+        resolver.connect(user2).setOwner(node, user3.address)
+      ).to.be.revertedWith("Not authorized");
     });
 
-    it("Should reject operations on expired domains", async function () {
-      // Fast forward past domain expiry
-      await ethers.provider.send("evm_increaseTime", [oneYear + 1]);
-      await ethers.provider.send("evm_mine", []);
+    it("Should fallback to registry owner when resolver owner not set", async function () {
+      const { resolver, registry, user1, node } = await loadFixture(registerDomainFixture);
+
+      // Deploy new resolver without setting owner
+      const ResolverFactory = await ethers.getContractFactory("GraphiteResolver");
+      const newResolver = await ResolverFactory.deploy(await registry.getAddress());
+
+      expect(await newResolver.owner(node)).to.equal(user1.address); // Should fallback to registry
+    });
+  });
+
+  describe("Operator Management", function () {
+    it("Should allow owner to set operators", async function () {
+      const { resolver, user1, operator, node } = await loadFixture(registerDomainFixture);
 
       await expect(
-        resolver.connect(domainOwner).setText(domainNode, "expired", "should fail")
-      ).to.be.revertedWith("Domain expired");
+        resolver.connect(user1).setOperator(node, operator.address, true)
+      ).to.emit(resolver, "OperatorChanged")
+       .withArgs(node, operator.address, true);
+
+      expect(await resolver.isOperator(node, operator.address)).to.be.true;
+    });
+
+    it("Should allow owner to revoke operators", async function () {
+      const { resolver, user1, operator, node } = await loadFixture(registerDomainFixture);
+
+      // First set operator
+      await resolver.connect(user1).setOperator(node, operator.address, true);
+
+      // Then revoke
+      await expect(
+        resolver.connect(user1).setOperator(node, operator.address, false)
+      ).to.emit(resolver, "OperatorChanged")
+       .withArgs(node, operator.address, false);
+
+      expect(await resolver.isOperator(node, operator.address)).to.be.false;
+    });
+
+    it("Should prevent non-owner from setting operators", async function () {
+      const { resolver, user2, operator, node } = await loadFixture(registerDomainFixture);
+
+      await expect(
+        resolver.connect(user2).setOperator(node, operator.address, true)
+      ).to.be.revertedWith("Not node owner");
     });
   });
 
   describe("Text Records", function () {
-    it("Should set and get text records", async function () {
-      await resolver.connect(domainOwner).setText(domainNode, "description", "My awesome domain");
-      expect(await resolver.text(domainNode, "description")).to.equal("My awesome domain");
+    it("Should allow owner to set text records", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      await expect(
+        resolver.connect(user1).setText(node, "email", "alice@example.com")
+      ).to.emit(resolver, "TextChanged")
+       .withArgs(node, "email", "alice@example.com");
+
+      expect(await resolver.text(node, "email")).to.equal("alice@example.com");
     });
 
-    it("Should handle multiple text records", async function () {
-      await resolver.connect(domainOwner).setText(domainNode, "email", "user@example.com");
-      await resolver.connect(domainOwner).setText(domainNode, "url", "https://example.com");
-      await resolver.connect(domainOwner).setText(domainNode, "description", "Test domain");
+    it("Should allow operator to set text records", async function () {
+      const { resolver, user1, operator, node } = await loadFixture(registerDomainFixture);
 
-      expect(await resolver.text(domainNode, "email")).to.equal("user@example.com");
-      expect(await resolver.text(domainNode, "url")).to.equal("https://example.com");
-      expect(await resolver.text(domainNode, "description")).to.equal("Test domain");
+      // Set operator
+      await resolver.connect(user1).setOperator(node, operator.address, true);
+
+      // Operator sets text record
+      await expect(
+        resolver.connect(operator).setText(node, "url", "https://alice.com")
+      ).to.emit(resolver, "TextChanged")
+       .withArgs(node, "url", "https://alice.com");
+
+      expect(await resolver.text(node, "url")).to.equal("https://alice.com");
     });
 
-    it("Should handle empty text records", async function () {
-      expect(await resolver.text(domainNode, "nonexistent")).to.equal("");
+    it("Should prevent unauthorized text record modification", async function () {
+      const { resolver, user2, node } = await loadFixture(registerDomainFixture);
+
+      await expect(
+        resolver.connect(user2).setText(node, "email", "hacker@evil.com")
+      ).to.be.revertedWith("Not authorized");
     });
 
-    it("Should allow clearing text records", async function () {
-      await resolver.connect(domainOwner).setText(domainNode, "temp", "temporary value");
-      expect(await resolver.text(domainNode, "temp")).to.equal("temporary value");
+    it("Should allow deleting text records", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
 
-      await resolver.connect(domainOwner).clearText(domainNode, "temp");
-      expect(await resolver.text(domainNode, "temp")).to.equal("");
+      // Set record first
+      await resolver.connect(user1).setText(node, "email", "alice@example.com");
+      expect(await resolver.text(node, "email")).to.equal("alice@example.com");
+
+      // Delete record
+      await expect(
+        resolver.connect(user1).deleteText(node, "email")
+      ).to.emit(resolver, "TextDeleted")
+       .withArgs(node, "email");
+
+      expect(await resolver.text(node, "email")).to.equal("");
     });
 
     it("Should support batch text record operations", async function () {
-      const keys = ["email", "url", "description"];
-      const values = ["user@example.com", "https://example.com", "Test domain"];
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
 
-      const tx = await resolver.connect(domainOwner).setTextBatch(domainNode, keys, values);
-      const receipt = await tx.wait();
-      
-      // Should emit TextChanged event for each key
-      expect(receipt!.logs.length).to.be.greaterThanOrEqual(3);
-
-      for (let i = 0; i < keys.length; i++) {
-        expect(await resolver.text(domainNode, keys[i])).to.equal(values[i]);
-      }
-    });
-
-    it("Should reject batch operations with mismatched arrays", async function () {
-      const keys = ["email", "url"];
-      const values = ["user@example.com"]; // Missing second value
+      const keys = ["email", "url", "avatar"];
+      const values = ["alice@example.com", "https://alice.com", "ipfs://Qm..."];
 
       await expect(
-        resolver.connect(domainOwner).setTextBatch(domainNode, keys, values)
-      ).to.be.revertedWith("Array length mismatch");
+        resolver.connect(user1).setMultipleTexts(node, keys, values)
+      ).to.emit(resolver, "TextChanged"); // Will emit multiple events
+
+      expect(await resolver.text(node, "email")).to.equal("alice@example.com");
+      expect(await resolver.text(node, "url")).to.equal("https://alice.com");
+      expect(await resolver.text(node, "avatar")).to.equal("ipfs://Qm...");
     });
 
-    it("Should support standard record keys", async function () {
-      // Test standard keys are defined
-      expect(await resolver.AVATAR_KEY()).to.equal("avatar");
-      expect(await resolver.EMAIL_KEY()).to.equal("email");
-      expect(await resolver.URL_KEY()).to.equal("url");
-      expect(await resolver.DESCRIPTION_KEY()).to.equal("description");
+    it("Should handle empty values as deletions in batch operations", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      // Set some records first
+      await resolver.connect(user1).setText(node, "email", "alice@example.com");
+      await resolver.connect(user1).setText(node, "url", "https://alice.com");
+
+      // Batch update with empty value (delete)
+      const keys = ["email", "url"];
+      const values = ["", "https://newalice.com"]; // Empty email = delete
+
+      await resolver.connect(user1).setMultipleTexts(node, keys, values);
+
+      expect(await resolver.text(node, "email")).to.equal(""); // Deleted
+      expect(await resolver.text(node, "url")).to.equal("https://newalice.com"); // Updated
     });
   });
 
   describe("Address Records", function () {
-    it("Should set and get ETH address", async function () {
+    it("Should allow setting Ethereum addresses", async function () {
+      const { resolver, user1, user2, node } = await loadFixture(registerDomainFixture);
+
       await expect(
-        resolver.connect(domainOwner).setAddr(domainNode, domainOwner.address)
+        resolver.connect(user1).setAddr(node, user2.address)
       ).to.emit(resolver, "AddressChanged")
-       .withArgs(domainNode, domainOwner.address);
+       .withArgs(node, user2.address);
 
-      expect(await resolver.addr(domainNode)).to.equal(domainOwner.address);
+      expect(await resolver.addr(node)).to.equal(user2.address);
     });
 
-    it("Should handle zero address", async function () {
-      await resolver.connect(domainOwner).setAddr(domainNode, ethers.ZeroAddress);
-      expect(await resolver.addr(domainNode)).to.equal(ethers.ZeroAddress);
+    it("Should support multi-coin addresses", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      const btcAddress = "0x1234567890123456789012345678901234567890123456789012345678901234";
+      const coinType = 0; // Bitcoin
+
+      await expect(
+        resolver.connect(user1).setAddrByType(node, coinType, btcAddress)
+      ).to.emit(resolver, "AddressChangedByType")
+       .withArgs(node, coinType, btcAddress);
+
+      expect(await resolver.addrByType(node, coinType)).to.equal(btcAddress);
     });
 
-    it("Should return zero address for unset records", async function () {
-      expect(await resolver.addr(domainNode)).to.equal(ethers.ZeroAddress);
+    it("Should handle multiple coin types independently", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      const btcAddr = "0x1234567890123456789012345678901234567890123456789012345678901234";
+      const ethAddr = "0x9876543210987654321098765432109876543210987654321098765432109876";
+
+      await resolver.connect(user1).setAddrByType(node, 0, btcAddr); // Bitcoin
+      await resolver.connect(user1).setAddrByType(node, 60, ethAddr); // Ethereum
+
+      expect(await resolver.addrByType(node, 0)).to.equal(btcAddr);
+      expect(await resolver.addrByType(node, 60)).to.equal(ethAddr);
     });
   });
 
-  describe("Interface Support", function () {
-    it("Should set and get interface implementers", async function () {
-      const interfaceId = "0x12345678";
-      const implementer = unauthorized.address;
+  describe("Content Hash Records", function () {
+    it("Should allow setting content hash", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      const contentHash = ethers.randomBytes(32);
 
       await expect(
-        resolver.connect(domainOwner).setInterface(domainNode, interfaceId, implementer)
+        resolver.connect(user1).setContenthash(node, contentHash)
+      ).to.emit(resolver, "ContenthashChanged")
+       .withArgs(node, contentHash);
+
+      const storedHash = await resolver.contenthash(node);
+      expect(storedHash).to.equal(ethers.keccak256(contentHash));
+    });
+  });
+
+  describe("Name Records", function () {
+    it("Should allow setting canonical name", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      await expect(
+        resolver.connect(user1).setName(node, "alice.atgraphite")
+      ).to.emit(resolver, "NameChanged")
+       .withArgs(node, "alice.atgraphite");
+
+      expect(await resolver.name(node)).to.equal("alice.atgraphite");
+    });
+  });
+
+  describe("Public Key Records", function () {
+    it("Should allow setting public keys", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      const x = ethers.randomBytes(32);
+      const y = ethers.randomBytes(32);
+
+      await expect(
+        resolver.connect(user1).setPubkey(node, x, y)
+      ).to.emit(resolver, "PubkeyChanged")
+       .withArgs(node, x, y);
+
+      const [storedX, storedY] = await resolver.pubkey(node);
+      expect(storedX).to.equal(x);
+      expect(storedY).to.equal(y);
+    });
+  });
+
+  describe("ABI Records", function () {
+    it("Should allow setting ABI records", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      const contentType = 1;
+      const abiData = ethers.toUtf8Bytes('{"abi": "data"}');
+
+      await expect(
+        resolver.connect(user1).setABI(node, contentType, abiData)
+      ).to.emit(resolver, "ABIChanged")
+       .withArgs(node, contentType);
+
+      const [returnedType, returnedData] = await resolver.ABI(node, contentType);
+      expect(returnedType).to.equal(contentType);
+      expect(returnedData).to.equal(abiData);
+    });
+  });
+
+  describe("Interface Records", function () {
+    it("Should allow setting interface implementers", async function () {
+      const { resolver, user1, user2, node } = await loadFixture(registerDomainFixture);
+
+      const interfaceId = "0x01ffc9a7"; // ERC165
+
+      await expect(
+        resolver.connect(user1).setInterface(node, interfaceId, user2.address)
       ).to.emit(resolver, "InterfaceChanged")
-       .withArgs(domainNode, interfaceId, implementer);
+       .withArgs(node, interfaceId, user2.address);
 
-      expect(await resolver.interfaceImplementer(domainNode, interfaceId)).to.equal(implementer);
-    });
-
-    it("Should handle multiple interfaces", async function () {
-      const interface1 = "0x12345678";
-      const interface2 = "0x87654321";
-      const implementer1 = domainOwner.address;
-      const implementer2 = unauthorized.address;
-
-      await resolver.connect(domainOwner).setInterface(domainNode, interface1, implementer1);
-      await resolver.connect(domainOwner).setInterface(domainNode, interface2, implementer2);
-
-      expect(await resolver.interfaceImplementer(domainNode, interface1)).to.equal(implementer1);
-      expect(await resolver.interfaceImplementer(domainNode, interface2)).to.equal(implementer2);
+      expect(await resolver.interfaceImplementer(node, interfaceId)).to.equal(user2.address);
     });
   });
 
-  describe("Profile Management", function () {
-    it("Should set complete profile", async function () {
-      const displayName = "Alice Smith";
-      const description = "Blockchain developer";
-      const avatar = "ipfs://QmHash";
-      const url = "https://alice.example.com";
-      const ethAddress = domainOwner.address;
+  describe("Record Versioning", function () {
+    it("Should increment version on record changes", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
 
-      await resolver.connect(domainOwner).setProfile(
-        domainNode,
-        displayName,
-        description,
-        avatar,
-        url,
-        ethAddress
-      );
+      const initialVersion = await resolver.recordVersions(node);
 
-      const profile = await resolver.getProfile(domainNode);
-      expect(profile.displayName).to.equal(displayName);
-      expect(profile.description).to.equal(description);
-      expect(profile.avatar).to.equal(avatar);
-      expect(profile.url).to.equal(url);
-      expect(profile.ethAddress).to.equal(ethAddress);
+      await resolver.connect(user1).setText(node, "email", "alice@example.com");
+
+      const newVersion = await resolver.recordVersions(node);
+      expect(newVersion).to.equal(initialVersion + 1n);
     });
 
-    it("Should handle partial profile updates", async function () {
-      await resolver.connect(domainOwner).setProfile(
-        domainNode,
-        "Alice",
-        "", // empty description
-        "ipfs://avatar",
-        "", // empty url
-        ethers.ZeroAddress
-      );
+    it("Should emit version change events", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
 
-      const profile = await resolver.getProfile(domainNode);
-      expect(profile.displayName).to.equal("Alice");
-      expect(profile.description).to.equal("");
-      expect(profile.avatar).to.equal("ipfs://avatar");
-      expect(profile.url).to.equal("");
-      expect(profile.ethAddress).to.equal(ethers.ZeroAddress);
-    });
-
-    it("Should allow profile updates", async function () {
-      // Set initial profile
-      await resolver.connect(domainOwner).setProfile(
-        domainNode,
-        "Alice",
-        "Developer",
-        "ipfs://avatar1",
-        "https://alice.com",
-        domainOwner.address
-      );
-
-      // Update profile
-      await resolver.connect(domainOwner).setProfile(
-        domainNode,
-        "Alice Smith",
-        "Senior Developer",
-        "ipfs://avatar2",
-        "https://alicesmith.com",
-        unauthorized.address
-      );
-
-      const profile = await resolver.getProfile(domainNode);
-      expect(profile.displayName).to.equal("Alice Smith");
-      expect(profile.description).to.equal("Senior Developer");
-      expect(profile.avatar).to.equal("ipfs://avatar2");
-      expect(profile.url).to.equal("https://alicesmith.com");
-      expect(profile.ethAddress).to.equal(unauthorized.address);
-    });
-  });
-
-  describe("Record Cleanup", function () {
-    beforeEach(async function () {
-      // Set up some records
-      await resolver.connect(domainOwner).setText(domainNode, "email", "test@example.com");
-      await resolver.connect(domainOwner).setText(domainNode, "url", "https://example.com");
-      await resolver.connect(domainOwner).setText(domainNode, "description", "Test domain");
-      await resolver.connect(domainOwner).setAddr(domainNode, domainOwner.address);
-    });
-
-    it("Should clear all records", async function () {
-      const textKeys = ["email", "url", "description"];
-      
-      await resolver.connect(domainOwner).clearAllRecords(domainNode, textKeys);
-
-      // Check text records cleared
-      for (const key of textKeys) {
-        expect(await resolver.text(domainNode, key)).to.equal("");
-      }
-
-      // Check address record cleared
-      expect(await resolver.addr(domainNode)).to.equal(ethers.ZeroAddress);
-    });
-
-    it("Should emit events when clearing records", async function () {
-      const textKeys = ["email", "url"];
-      
       await expect(
-        resolver.connect(domainOwner).clearAllRecords(domainNode, textKeys)
-      ).to.emit(resolver, "TextChanged")
-       .and.to.emit(resolver, "AddressChanged");
-    });
-
-    it("Should handle empty text keys array", async function () {
-      await resolver.connect(domainOwner).clearAllRecords(domainNode, []);
-      
-      // Text records should remain
-      expect(await resolver.text(domainNode, "email")).to.equal("test@example.com");
-      
-      // Address should be cleared
-      expect(await resolver.addr(domainNode)).to.equal(ethers.ZeroAddress);
+        resolver.connect(user1).setText(node, "email", "alice@example.com")
+      ).to.emit(resolver, "VersionChanged");
     });
   });
 
-  describe("Pausing Functionality", function () {
-    it("Should allow pausing and unpausing", async function () {
-      await resolver.pause();
+  describe("Batch Operations", function () {
+    it("Should support multicall for batch operations", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      // Encode multiple calls
+      const calls = [
+        resolver.interface.encodeFunctionData("setText", [node, "email", "alice@example.com"]),
+        resolver.interface.encodeFunctionData("setText", [node, "url", "https://alice.com"]),
+        resolver.interface.encodeFunctionData("setAddr", [node, user1.address])
+      ];
+
+      await expect(resolver.connect(user1).multicall(calls)).to.not.be.reverted;
+
+      expect(await resolver.text(node, "email")).to.equal("alice@example.com");
+      expect(await resolver.text(node, "url")).to.equal("https://alice.com");
+      expect(await resolver.addr(node)).to.equal(user1.address);
+    });
+  });
+
+  describe("Clear Records", function () {
+    it("Should allow clearing all records", async function () {
+      const { resolver, user1, user2, node } = await loadFixture(registerDomainFixture);
+
+      // Set various records
+      await resolver.connect(user1).setText(node, "email", "alice@example.com");
+      await resolver.connect(user1).setAddr(node, user2.address);
+      await resolver.connect(user1).setName(node, "alice.atgraphite");
+
+      // Clear all records
+      await resolver.connect(user1).clearRecords(node);
+
+      // Verify records are cleared
+      expect(await resolver.text(node, "email")).to.equal("");
+      expect(await resolver.addr(node)).to.equal(ZERO_ADDRESS);
+      expect(await resolver.name(node)).to.equal("");
+    });
+  });
+
+  describe("Node Validation", function () {
+    it("Should prevent operations on non-existent nodes", async function () {
+      const { resolver, user1 } = await loadFixture(deployResolverFixture);
+
+      const fakeNode = ethers.keccak256(ethers.toUtf8Bytes("nonexistent"));
+
+      await expect(
+        resolver.connect(user1).setText(fakeNode, "email", "test@example.com")
+      ).to.be.revertedWith("Node does not exist");
+    });
+
+    it("Should prevent operations on expired nodes", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      // Fast forward past expiry
+      await time.increase(oneYear + 1);
+
+      await expect(
+        resolver.connect(user1).setText(node, "email", "test@example.com")
+      ).to.be.revertedWith("Node expired");
+    });
+  });
+
+  describe("Access Control", function () {
+    it("Should allow admin emergency access", async function () {
+      const { resolver, owner, node } = await loadFixture(registerDomainFixture);
+
+      // Admin should be able to set records in emergency
+      await expect(
+        resolver.connect(owner).setText(node, "emergency", "admin-access")
+      ).to.not.be.reverted;
+
+      expect(await resolver.text(node, "emergency")).to.equal("admin-access");
+    });
+
+    it("Should allow pausing by admin", async function () {
+      const { resolver, owner } = await loadFixture(deployResolverFixture);
+
+      await expect(resolver.pause()).to.emit(resolver, "Paused");
       expect(await resolver.paused()).to.be.true;
-
-      await expect(
-        resolver.connect(domainOwner).setText(domainNode, "test", "value")
-      ).to.be.revertedWith("Pausable: paused");
-
-      await resolver.unpause();
-      expect(await resolver.paused()).to.be.false;
-
-      // Should work after unpausing
-      await resolver.connect(domainOwner).setText(domainNode, "test", "value");
-      expect(await resolver.text(domainNode, "test")).to.equal("value");
     });
 
-    it("Should restrict pause functions to admin", async function () {
-      await expect(
-        resolver.connect(unauthorized).pause()
-      ).to.be.reverted;
+    it("Should prevent operations when paused", async function () {
+      const { resolver, owner, user1, node } = await loadFixture(registerDomainFixture);
+
+      await resolver.pause();
 
       await expect(
-        resolver.connect(unauthorized).unpause()
-      ).to.be.reverted;
+        resolver.connect(user1).setText(node, "test", "value")
+      ).to.be.revertedWith("Pausable: paused");
     });
   });
 
   describe("Edge Cases", function () {
-    it("Should handle very long text values", async function () {
-      const longText = "a".repeat(1000);
-      
-      await resolver.connect(domainOwner).setText(domainNode, "long", longText);
-      expect(await resolver.text(domainNode, "long")).to.equal(longText);
-    });
-
-    it("Should handle special characters in text", async function () {
-      const specialText = "Hello 世界! 🌍 Special chars: àáâãäå";
-      
-      await resolver.connect(domainOwner).setText(domainNode, "special", specialText);
-      expect(await resolver.text(domainNode, "special")).to.equal(specialText);
-    });
-
     it("Should handle empty string values", async function () {
-      await resolver.connect(domainOwner).setText(domainNode, "empty", "");
-      expect(await resolver.text(domainNode, "empty")).to.equal("");
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      await resolver.connect(user1).setText(node, "empty", "");
+      expect(await resolver.text(node, "empty")).to.equal("");
     });
 
-    it("Should handle records for non-existent domains", async function () {
-      const fakeNode = ethers.keccak256(ethers.toUtf8Bytes("nonexistent"));
-      
+    it("Should handle very long text records", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      const longText = "a".repeat(1000);
+      await resolver.connect(user1).setText(node, "long", longText);
+      expect(await resolver.text(node, "long")).to.equal(longText);
+    });
+
+    it("Should handle zero addresses", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      await resolver.connect(user1).setAddr(node, ZERO_ADDRESS);
+      expect(await resolver.addr(node)).to.equal(ZERO_ADDRESS);
+    });
+
+    it("Should handle batch operations with mismatched array lengths", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      const keys = ["email", "url"];
+      const values = ["alice@example.com"]; // One less value
+
       await expect(
-        resolver.connect(domainOwner).setText(fakeNode, "test", "value")
-      ).to.be.revertedWith("Not authorized for this domain");
+        resolver.connect(user1).setMultipleTexts(node, keys, values)
+      ).to.be.revertedWith("Array length mismatch");
     });
   });
 
   describe("Gas Optimization", function () {
-    it("Should efficiently handle batch operations", async function () {
-      const keys = Array.from({length: 10}, (_, i) => `key${i}`);
-      const values = Array.from({length: 10}, (_, i) => `value${i}`);
+    it("Should be gas efficient for single record operations", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
 
-      const tx = await resolver.connect(domainOwner).setTextBatch(domainNode, keys, values);
+      const tx = await resolver.connect(user1).setText(node, "email", "alice@example.com");
       const receipt = await tx.wait();
-      
-      // Should be more efficient than individual calls
-      expect(receipt!.gasUsed).to.be.lt(ethers.parseUnits("500000", "wei"));
+
+      expect(receipt!.gasUsed).to.be.lt(100000); // Should be reasonably efficient
     });
 
-    it("Should handle large profile updates efficiently", async function () {
-      const tx = await resolver.connect(domainOwner).setProfile(
-        domainNode,
-        "Very Long Display Name That Exceeds Normal Limits",
-        "Very long description that contains a lot of text and should test the gas efficiency of the profile setting function when dealing with longer strings",
-        "ipfs://QmVeryLongHashThatRepresentsAnAvatarImageStoredOnIPFS",
-        "https://verylongdomainname.example.com/with/very/long/path/structure",
-        domainOwner.address
-      );
-      
-      const receipt = await tx.wait();
-      expect(receipt!.gasUsed).to.be.lt(ethers.parseUnits("200000", "wei"));
+    it("Should be more efficient for batch operations", async function () {
+      const { resolver, user1, node } = await loadFixture(registerDomainFixture);
+
+      const keys = ["email", "url", "avatar", "description"];
+      const values = [
+        "alice@example.com",
+        "https://alice.com", 
+        "ipfs://Qm...",
+        "Alice's domain"
+      ];
+
+      const batchTx = await resolver.connect(user1).setMultipleTexts(node, keys, values);
+      const batchReceipt = await batchTx.wait();
+
+      // Should be more efficient than 4 individual calls
+      expect(batchReceipt!.gasUsed).to.be.lt(300000);
     });
   });
 
-  describe("Integration with Registry", function () {
-    it("Should properly validate domain ownership through registry", async function () {
-      // Transfer domain ownership via NFT
-      const tokenId = await registry.getTokenOfNode(domainNode);
-      await registry.connect(domainOwner).transferFrom(
-        domainOwner.address,
-        unauthorized.address,
-        tokenId
-      );
+  describe("Interface Support", function () {
+    it("Should support ERC165 interface detection", async function () {
+      const { resolver } = await loadFixture(deployResolverFixture);
 
-      // Original owner should no longer be able to set records
-      await expect(
-        resolver.connect(domainOwner).setText(domainNode, "test", "should fail")
-      ).to.be.revertedWith("Not authorized for this domain");
-
-      // New owner should be able to set records
-      await resolver.connect(unauthorized).setText(domainNode, "test", "should work");
-      expect(await resolver.text(domainNode, "test")).to.equal("should work");
-    });
-
-    it("Should handle registry address changes gracefully", async function () {
-      // This tests that the resolver properly integrates with the registry
-      const domain = await registry.getDomain(domainNode);
-      expect(domain.owner).to.equal(domainOwner.address);
-      
-      // Should be able to set records
-      await resolver.connect(domainOwner).setText(domainNode, "integration", "test");
-      expect(await resolver.text(domainNode, "integration")).to.equal("test");
+      expect(await resolver.supportsInterface("0x01ffc9a7")).to.be.true; // ERC165
     });
   });
 });

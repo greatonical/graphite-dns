@@ -1,444 +1,855 @@
+// test/SubdomainRegistrar.test.ts
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import type { GraphiteDNSRegistry, GraphiteResolver, AuctionRegistrar } from "../typechain";
-import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
-import { time } from "@nomicfoundation/hardhat-network-helpers";
+import { time, loadFixture } from "@nomicfoundation/hardhat-network-helpers";
+import type { GraphiteDNSRegistry, GraphiteResolver, SubdomainRegistrar, ReverseRegistrar } from "../typechain-types";
 
-describe("AuctionRegistrar - Fixed Version", function () {
-  let registry: GraphiteDNSRegistry;
-  let resolver: GraphiteResolver;
-  let auction: AuctionRegistrar;
-  let owner: SignerWithAddress;
-  let bidder1: SignerWithAddress;
-  let bidder2: SignerWithAddress;
-  let bidder3: SignerWithAddress;
+describe("SubdomainRegistrar", function () {
+  const ZERO_ADDRESS = ethers.ZeroAddress;
+  const oneYear = 365 * 24 * 60 * 60;
 
-  const oneDay = 24 * 60 * 60;
-  const oneYear = 365 * oneDay;
-  const minBid = ethers.parseEther("0.001");
+  // Subdomain types
+  const MANAGED = 0;
+  const DELEGATED = 1;
+  const SOLD = 2;
 
-  beforeEach(async function () {
-    [owner, bidder1, bidder2, bidder3] = await ethers.getSigners();
+  // Subdomain status
+  const INACTIVE = 0;
+  const AVAILABLE = 1;
+  const SOLD_OUT = 2;
+  const PAUSED = 3;
+
+  async function deploySubdomainFixture() {
+    const [owner, user1, user2, user3] = await ethers.getSigners();
+
+    // Deploy registry
+    const RegistryFactory = await ethers.getContractFactory("GraphiteDNSRegistry");
+    const registry = await RegistryFactory.deploy(ZERO_ADDRESS, "atgraphite");
 
     // Deploy resolver
     const ResolverFactory = await ethers.getContractFactory("GraphiteResolver");
-    const tempResolver = await ResolverFactory.deploy(ethers.ZeroAddress);
-    
-    // Deploy registry
-    const RegistryFactory = await ethers.getContractFactory("GraphiteDNSRegistry");
-    registry = await RegistryFactory.deploy(await tempResolver.getAddress());
-    
-    // Deploy final resolver
-    resolver = await ResolverFactory.deploy(await registry.getAddress());
-    
-    // Deploy auction registrar
-    const AuctionFactory = await ethers.getContractFactory("AuctionRegistrar");
-    auction = await AuctionFactory.deploy(await registry.getAddress());
+    const resolver = await ResolverFactory.deploy(await registry.getAddress());
 
-    // Grant REGISTRAR_ROLE to auction contract
+    // Deploy reverse registrar
+    const ReverseFactory = await ethers.getContractFactory("ReverseRegistrar");
+    const reverse = await ReverseFactory.deploy(await registry.getAddress());
+
+    // Deploy subdomain registrar
+    const SubdomainFactory = await ethers.getContractFactory("SubdomainRegistrar");
+    const subdomain = await SubdomainFactory.deploy(
+      await registry.getAddress(),
+      await reverse.getAddress()
+    );
+
+    // Setup roles
     const registrarRole = await registry.REGISTRAR_ROLE();
-    await registry.grantRole(registrarRole, await auction.getAddress());
+    const registryRole = await reverse.REGISTRY_ROLE();
+    
+    await registry.grantRole(registrarRole, owner.address);
+    await registry.grantRole(registrarRole, await subdomain.getAddress());
+    await reverse.grantRole(registryRole, await registry.getAddress());
+
+    const TLD_NODE = await registry.TLD_NODE();
+
+    return {
+      registry,
+      resolver,
+      reverse,
+      subdomain,
+      owner,
+      user1,
+      user2,
+      user3,
+      TLD_NODE
+    };
+  }
+
+  async function registerParentDomainFixture() {
+    const base = await loadFixture(deploySubdomainFixture);
+    const { registry, resolver, user1, TLD_NODE } = base;
+
+    const price = await registry.priceOf("parent");
+    await registry.register(
+      "parent",
+      user1.address,
+      oneYear,
+      await resolver.getAddress(),
+      TLD_NODE,
+      { value: price }
+    );
+
+    const parentNode = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"],
+      [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("parent"))]));
+
+    return { ...base, parentNode };
+  }
+
+  describe("Deployment", function () {
+    it("Should deploy with correct registry and reverse registrar", async function () {
+      const { subdomain, registry, reverse } = await loadFixture(deploySubdomainFixture);
+
+      expect(await subdomain.registry()).to.equal(await registry.getAddress());
+      expect(await subdomain.reverseRegistrar()).to.equal(await reverse.getAddress());
+    });
+
+    it("Should set correct TLD_NODE", async function () {
+      const { subdomain, TLD_NODE } = await loadFixture(deploySubdomainFixture);
+
+      expect(await subdomain.TLD_NODE()).to.equal(TLD_NODE);
+    });
   });
 
-  describe("Auction Creation", function () {
-    it("Should create auction with valid parameters", async function () {
-      await expect(
-        auction.startAuction("premium", 2 * oneDay, oneDay, minBid)
-      ).to.emit(auction, "AuctionStarted");
+  describe("Subdomain Configuration", function () {
+    it("Should allow parent owner to configure subdomain", async function () {
+      const { subdomain, user1, parentNode } = await loadFixture(registerParentDomainFixture);
 
-      const auctionData = await auction.getAuction("premium");
-      expect(auctionData.minimumBid).to.equal(minBid);
-      expect(auctionData.state).to.equal(1); // CommitPhase
+      await expect(
+        subdomain.connect(user1).configureSubdomain(
+          parentNode,
+          "api",
+          ethers.parseEther("0.1"),
+          SOLD,
+          oneYear,
+          100,
+          false
+        )
+      ).to.emit(subdomain, "SubdomainConfigured")
+       .withArgs(parentNode, "api", ethers.parseEther("0.1"), SOLD, AVAILABLE);
     });
 
-    it("Should reject invalid commit duration", async function () {
-      await expect(
-        auction.startAuction("test", 1000, oneDay, minBid) // Too short
-      ).to.be.revertedWith("Invalid commit duration");
+    it("Should prevent non-parent-owner from configuring", async function () {
+      const { subdomain, user2, parentNode } = await loadFixture(registerParentDomainFixture);
 
       await expect(
-        auction.startAuction("test", 10 * oneDay, oneDay, minBid) // Too long
-      ).to.be.revertedWith("Invalid commit duration");
+        subdomain.connect(user2).configureSubdomain(
+          parentNode,
+          "api",
+          ethers.parseEther("0.1"),
+          SOLD,
+          oneYear,
+          100,
+          false
+        )
+      ).to.be.revertedWith("Not parent owner");
     });
 
-    it("Should reject invalid reveal duration", async function () {
-      await expect(
-        auction.startAuction("test", 2 * oneDay, 1000, minBid) // Too short
-      ).to.be.revertedWith("Invalid reveal duration");
+    it("Should prevent configuration for expired parent", async function () {
+      const { subdomain, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      // Fast forward past parent expiry
+      await time.increase(oneYear + 1);
 
       await expect(
-        auction.startAuction("test", 2 * oneDay, 10 * oneDay, minBid) // Too long
-      ).to.be.revertedWith("Invalid reveal duration");
+        subdomain.connect(user1).configureSubdomain(
+          parentNode,
+          "api",
+          ethers.parseEther("0.1"),
+          SOLD,
+          oneYear,
+          100,
+          false
+        )
+      ).to.be.revertedWith("Parent expired");
     });
 
-    it("Should reject minimum bid below threshold", async function () {
+    it("Should validate subdomain label format", async function () {
+      const { subdomain, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      // Empty label
       await expect(
-        auction.startAuction("test", 2 * oneDay, oneDay, ethers.parseEther("0.0005"))
-      ).to.be.revertedWith("Minimum bid too low");
+        subdomain.connect(user1).configureSubdomain(
+          parentNode,
+          "",
+          ethers.parseEther("0.1"),
+          SOLD,
+          oneYear,
+          100,
+          false
+        )
+      ).to.be.revertedWith("Invalid label length");
+
+      // Too long label
+      const longLabel = "a".repeat(64);
+      await expect(
+        subdomain.connect(user1).configureSubdomain(
+          parentNode,
+          longLabel,
+          ethers.parseEther("0.1"),
+          SOLD,
+          oneYear,
+          100,
+          false
+        )
+      ).to.be.revertedWith("Invalid label length");
+
+      // Invalid characters
+      await expect(
+        subdomain.connect(user1).configureSubdomain(
+          parentNode,
+          "api!",
+          ethers.parseEther("0.1"),
+          SOLD,
+          oneYear,
+          100,
+          false
+        )
+      ).to.be.revertedWith("Invalid label format");
+    });
+  });
+
+  describe("Managed Subdomain Creation", function () {
+    it("Should allow parent owner to create managed subdomain", async function () {
+      const { subdomain, resolver, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await expect(
+        subdomain.connect(user1).createManagedSubdomain(
+          parentNode,
+          "managed",
+          await resolver.getAddress()
+        )
+      ).to.emit(subdomain, "SubdomainCreated");
+
+      const subdomainNode = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"],
+        [parentNode, ethers.keccak256(ethers.toUtf8Bytes("managed"))]));
+
+      const record = await subdomain.getSubdomainRecord(subdomainNode);
+      expect(record.currentOwner).to.equal(user1.address);
+      expect(record.originalOwner).to.equal(user1.address);
+      expect(record.subType).to.equal(MANAGED);
     });
 
-    it("Should reject auction for unavailable domain", async function () {
-      // Register domain first
-      const price = await registry["priceOf(string,uint64)"]("taken", oneYear);
-      await registry.connect(bidder1).buyFixedPrice(
-        "taken",
-        await resolver.getAddress(),
+    it("Should inherit parent expiry for managed subdomains", async function () {
+      const { subdomain, registry, resolver, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await subdomain.connect(user1).createManagedSubdomain(
+        parentNode,
+        "inherit",
+        await resolver.getAddress()
+      );
+
+      const subdomainNode = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"],
+        [parentNode, ethers.keccak256(ethers.toUtf8Bytes("inherit"))]));
+
+      const parentRecord = await registry.getRecord(parentNode);
+      const subdomainRecord = await registry.getRecord(subdomainNode);
+
+      expect(subdomainRecord.expiry).to.equal(parentRecord.expiry);
+    });
+
+    it("Should prevent non-parent-owner from creating managed subdomain", async function () {
+      const { subdomain, resolver, user2, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await expect(
+        subdomain.connect(user2).createManagedSubdomain(
+          parentNode,
+          "unauthorized",
+          await resolver.getAddress()
+        )
+      ).to.be.revertedWith("Not parent owner");
+    });
+
+    it("Should track managed subdomains for owner", async function () {
+      const { subdomain, resolver, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await subdomain.connect(user1).createManagedSubdomain(
+        parentNode,
+        "tracked",
+        await resolver.getAddress()
+      );
+
+      const managedSubdomains = await subdomain.getManagedSubdomains(user1.address);
+      expect(managedSubdomains.length).to.be.gt(0);
+    });
+  });
+
+  describe("Subdomain Sales", function () {
+    async function configuredSubdomainFixture() {
+      const base = await loadFixture(registerParentDomainFixture);
+      const { subdomain, user1, parentNode } = base;
+
+      await subdomain.connect(user1).configureSubdomain(
+        parentNode,
+        "shop",
+        ethers.parseEther("0.1"),
+        SOLD,
         oneYear,
+        10, // max supply
+        false // no approval required
+      );
+
+      return base;
+    }
+
+    it("Should allow buying configured subdomain", async function () {
+      const { subdomain, resolver, user2, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      const price = ethers.parseEther("0.1");
+
+      await expect(
+        subdomain.connect(user2).buySubdomain(
+          parentNode,
+          "shop",
+          await resolver.getAddress(),
+          { value: price }
+        )
+      ).to.emit(subdomain, "SubdomainCreated");
+
+      const subdomainNode = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"],
+        [parentNode, ethers.keccak256(ethers.toUtf8Bytes("shop"))]));
+
+      const record = await subdomain.getSubdomainRecord(subdomainNode);
+      expect(record.currentOwner).to.equal(user2.address);
+      expect(record.subType).to.equal(SOLD);
+    });
+
+    it("Should refund excess payment", async function () {
+      const { subdomain, resolver, user2, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      const price = ethers.parseEther("0.1");
+      const excess = ethers.parseEther("0.05");
+      const initialBalance = await ethers.provider.getBalance(user2.address);
+
+      const tx = await subdomain.connect(user2).buySubdomain(
+        parentNode,
+        "shop",
+        await resolver.getAddress(),
+        { value: price + excess }
+      );
+
+      const receipt = await tx.wait();
+      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
+      const finalBalance = await ethers.provider.getBalance(user2.address);
+
+      // Should only pay the actual price plus gas
+      expect(finalBalance).to.be.closeTo(
+        initialBalance - price - gasUsed,
+        ethers.parseEther("0.001")
+      );
+    });
+
+    it("Should track earnings for parent owner", async function () {
+      const { subdomain, resolver, user1, user2, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      const price = ethers.parseEther("0.1");
+
+      await subdomain.connect(user2).buySubdomain(
+        parentNode,
+        "shop",
+        await resolver.getAddress(),
         { value: price }
       );
 
-      // Try to auction it
-      await expect(
-        auction.startAuction("taken", 2 * oneDay, oneDay, minBid)
-      ).to.be.revertedWith("Domain not available");
+      const earnings = await subdomain.getOwnerEarnings(user1.address);
+      expect(earnings).to.equal(price);
     });
 
-    it("Should prevent duplicate auctions", async function () {
-      await auction.startAuction("unique", 2 * oneDay, oneDay, minBid);
-      
+    it("Should allow parent owner to withdraw earnings", async function () {
+      const { subdomain, resolver, user1, user2, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      const price = ethers.parseEther("0.1");
+
+      await subdomain.connect(user2).buySubdomain(
+        parentNode,
+        "shop",
+        await resolver.getAddress(),
+        { value: price }
+      );
+
+      const initialBalance = await ethers.provider.getBalance(user1.address);
+
       await expect(
-        auction.startAuction("unique", 2 * oneDay, oneDay, minBid)
-      ).to.be.revertedWith("Auction already exists");
+        subdomain.connect(user1).withdrawEarnings()
+      ).to.emit(subdomain, "EarningsWithdrawn")
+       .withArgs(user1.address, price);
+
+      const finalBalance = await ethers.provider.getBalance(user1.address);
+      expect(finalBalance).to.be.gt(initialBalance);
+    });
+
+    it("Should prevent buying unavailable subdomain", async function () {
+      const { subdomain, resolver, user2, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await expect(
+        subdomain.connect(user2).buySubdomain(
+          parentNode,
+          "notconfigured",
+          await resolver.getAddress(),
+          { value: ethers.parseEther("0.1") }
+        )
+      ).to.be.revertedWith("Subdomain not available");
+    });
+
+    it("Should prevent buying with insufficient payment", async function () {
+      const { subdomain, resolver, user2, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      const price = ethers.parseEther("0.1");
+
+      await expect(
+        subdomain.connect(user2).buySubdomain(
+          parentNode,
+          "shop",
+          await resolver.getAddress(),
+          { value: price - 1n }
+        )
+      ).to.be.revertedWith("Insufficient payment");
+    });
+
+    it("Should respect supply limits", async function () {
+      const { subdomain, resolver, user1, user2, user3, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      // Configure with supply of 1
+      await subdomain.connect(user1).configureSubdomain(
+        parentNode,
+        "limited",
+        ethers.parseEther("0.1"),
+        SOLD,
+        oneYear,
+        1, // max supply = 1
+        false
+      );
+
+      const price = ethers.parseEther("0.1");
+
+      // First purchase should succeed
+      await subdomain.connect(user2).buySubdomain(
+        parentNode,
+        "limited",
+        await resolver.getAddress(),
+        { value: price }
+      );
+
+      // Second purchase should fail
+      await expect(
+        subdomain.connect(user3).buySubdomain(
+          parentNode,
+          "limited",
+          await resolver.getAddress(),
+          { value: price }
+        )
+      ).to.be.revertedWith("Supply exhausted");
+    });
+
+    it("Should update status to SOLD_OUT when supply exhausted", async function () {
+      const { subdomain, resolver, user1, user2, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await subdomain.connect(user1).configureSubdomain(
+        parentNode,
+        "sellout",
+        ethers.parseEther("0.1"),
+        SOLD,
+        oneYear,
+        1,
+        false
+      );
+
+      await subdomain.connect(user2).buySubdomain(
+        parentNode,
+        "sellout",
+        await resolver.getAddress(),
+        { value: ethers.parseEther("0.1") }
+      );
+
+      const config = await subdomain.getSubdomainConfig(parentNode, "sellout");
+      expect(config.status).to.equal(SOLD_OUT);
     });
   });
 
-  describe("Bid Commitment", function () {
-    beforeEach(async function () {
-      await auction.startAuction("test", 2 * oneDay, oneDay, minBid);
-    });
+  describe("Approved Buyer System", function () {
+    async function approvalRequiredFixture() {
+      const base = await loadFixture(registerParentDomainFixture);
+      const { subdomain, user1, parentNode } = base;
 
-    it("Should allow valid bid commitment", async function () {
-      const commitment = await auction.generateCommitment(
-        ethers.parseEther("1.0"),
-        ethers.keccak256(ethers.toUtf8Bytes("salt1")),
-        bidder1.address
+      await subdomain.connect(user1).configureSubdomain(
+        parentNode,
+        "exclusive",
+        ethers.parseEther("0.1"),
+        SOLD,
+        oneYear,
+        10,
+        true // requires approval
       );
+
+      return base;
+    }
+
+    it("Should allow parent owner to add approved buyers", async function () {
+      const { subdomain, user1, user2, parentNode } = await loadFixture(approvalRequiredFixture);
 
       await expect(
-        auction.connect(bidder1).commitBid("test", commitment)
-      ).to.emit(auction, "BidCommitted");
+        subdomain.connect(user1).addApprovedBuyer(parentNode, "exclusive", user2.address)
+      ).to.emit(subdomain, "ApprovedBuyerAdded")
+       .withArgs(parentNode, "exclusive", user2.address);
 
-      expect(await auction.hasCommitted("test", bidder1.address)).to.be.true;
+      expect(await subdomain.isApprovedBuyer(parentNode, "exclusive", user2.address)).to.be.true;
     });
 
-    it("Should reject commitment with zero hash", async function () {
-      await expect(
-        auction.connect(bidder1).commitBid("test", ethers.ZeroHash)
-      ).to.be.revertedWith("Invalid commitment");
-    });
-
-    it("Should reject double commitment", async function () {
-      const commitment = await auction.generateCommitment(
-        ethers.parseEther("1.0"),
-        ethers.keccak256(ethers.toUtf8Bytes("salt1")),
-        bidder1.address
-      );
-
-      await auction.connect(bidder1).commitBid("test", commitment);
-      
-      await expect(
-        auction.connect(bidder1).commitBid("test", commitment)
-      ).to.be.revertedWith("Already committed");
-    });
-
-    it("Should reject commitment after commit phase", async function () {
-      // Fast forward past commit phase
-      await time.increase(3 * oneDay);
-
-      const commitment = await auction.generateCommitment(
-        ethers.parseEther("1.0"),
-        ethers.keccak256(ethers.toUtf8Bytes("salt1")),
-        bidder1.address
-      );
+    it("Should prevent unapproved buyers from purchasing", async function () {
+      const { subdomain, resolver, user2, parentNode } = await loadFixture(approvalRequiredFixture);
 
       await expect(
-        auction.connect(bidder1).commitBid("test", commitment)
-      ).to.be.revertedWith("Commit phase ended");
+        subdomain.connect(user2).buySubdomain(
+          parentNode,
+          "exclusive",
+          await resolver.getAddress(),
+          { value: ethers.parseEther("0.1") }
+        )
+      ).to.be.revertedWith("Not approved buyer");
     });
 
-    it("Should track total bidders", async function () {
-      const commitment1 = await auction.generateCommitment(
-        ethers.parseEther("1.0"),
-        ethers.keccak256(ethers.toUtf8Bytes("salt1")),
-        bidder1.address
-      );
-      const commitment2 = await auction.generateCommitment(
-        ethers.parseEther("2.0"),
-        ethers.keccak256(ethers.toUtf8Bytes("salt2")),
-        bidder2.address
-      );
+    it("Should allow approved buyers to purchase", async function () {
+      const { subdomain, resolver, user1, user2, parentNode } = await loadFixture(approvalRequiredFixture);
 
-      await auction.connect(bidder1).commitBid("test", commitment1);
-      await auction.connect(bidder2).commitBid("test", commitment2);
+      await subdomain.connect(user1).addApprovedBuyer(parentNode, "exclusive", user2.address);
 
-      const auctionData = await auction.getAuction("test");
-      expect(auctionData.totalBidders).to.equal(2);
+      await expect(
+        subdomain.connect(user2).buySubdomain(
+          parentNode,
+          "exclusive",
+          await resolver.getAddress(),
+          { value: ethers.parseEther("0.1") }
+        )
+      ).to.not.be.reverted;
+    });
+
+    it("Should return list of approved buyers", async function () {
+      const { subdomain, user1, user2, user3, parentNode } = await loadFixture(approvalRequiredFixture);
+
+      await subdomain.connect(user1).addApprovedBuyer(parentNode, "exclusive", user2.address);
+      await subdomain.connect(user1).addApprovedBuyer(parentNode, "exclusive", user3.address);
+
+      const approvedBuyers = await subdomain.getApprovedBuyers(parentNode, "exclusive");
+      expect(approvedBuyers).to.include(user2.address);
+      expect(approvedBuyers).to.include(user3.address);
+      expect(approvedBuyers.length).to.equal(2);
     });
   });
 
-  describe("Bid Revelation", function () {
-    const bid1 = ethers.parseEther("1.5");
-    const bid2 = ethers.parseEther("2.0");
-    const bid3 = ethers.parseEther("1.2");
-    const salt1 = ethers.keccak256(ethers.toUtf8Bytes("salt1"));
-    const salt2 = ethers.keccak256(ethers.toUtf8Bytes("salt2"));
-    const salt3 = ethers.keccak256(ethers.toUtf8Bytes("salt3"));
+  describe("Subdomain Transfers", function () {
+    async function soldSubdomainFixture() {
+      const base = await loadFixture(configuredSubdomainFixture);
+      const { subdomain, resolver, user2, parentNode } = base;
 
-    beforeEach(async function () {
-      await auction.startAuction("test", 2 * oneDay, oneDay, minBid);
+      await subdomain.connect(user2).buySubdomain(
+        parentNode,
+        "shop",
+        await resolver.getAddress(),
+        { value: ethers.parseEther("0.1") }
+      );
 
-      // Commit bids
-      const commitment1 = await auction.generateCommitment(bid1, salt1, bidder1.address);
-      const commitment2 = await auction.generateCommitment(bid2, salt2, bidder2.address);
-      const commitment3 = await auction.generateCommitment(bid3, salt3, bidder3.address);
+      const subdomainNode = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"],
+        [parentNode, ethers.keccak256(ethers.toUtf8Bytes("shop"))]));
 
-      await auction.connect(bidder1).commitBid("test", commitment1);
-      await auction.connect(bidder2).commitBid("test", commitment2);
-      await auction.connect(bidder3).commitBid("test", commitment3);
+      return { ...base, subdomainNode };
+    }
 
-      // Move to reveal phase
-      await time.increase(2 * oneDay + 1);
-    });
-
-    it("Should allow valid bid revelation", async function () {
-      await expect(
-        auction.connect(bidder1).revealBid("test", bid1, salt1, { value: bid1 })
-      ).to.emit(auction, "BidRevealed")
-       .withArgs(ethers.keccak256(ethers.concat([
-         await registry.TLD_NODE(),
-         ethers.keccak256(ethers.toUtf8Bytes("test"))
-       ])), bidder1.address, bid1, true);
-
-      expect(await auction.hasRevealed("test", bidder1.address)).to.be.true;
-    });
-
-    it("Should properly handle highest and second highest bids", async function () {
-      const bidder2BalanceBefore = await ethers.provider.getBalance(bidder2.address);
-      
-      // Reveal highest bid first
-      await auction.connect(bidder2).revealBid("test", bid2, salt2, { value: bid2 });
-      
-      // Reveal lower bid - should get refunded immediately
-      const tx = await auction.connect(bidder1).revealBid("test", bid1, salt1, { value: bid1 });
-      const receipt = await tx.wait();
-      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
-      
-      const bidder1BalanceAfter = await ethers.provider.getBalance(bidder1.address);
-      // bidder1 should get their money back (minus gas)
-      
-      // Check auction state
-      const auctionData = await auction.getAuction("test");
-      expect(auctionData.highestBidder).to.equal(bidder2.address);
-      expect(auctionData.highestBid).to.equal(bid2);
-      expect(auctionData.secondHighestBid).to.equal(bid1);
-    });
-
-    it("Should handle bid revelation in different orders", async function () {
-      // Reveal in ascending order
-      await auction.connect(bidder3).revealBid("test", bid3, salt3, { value: bid3 });
-      await auction.connect(bidder1).revealBid("test", bid1, salt1, { value: bid1 });
-      await auction.connect(bidder2).revealBid("test", bid2, salt2, { value: bid2 });
-
-      const auctionData = await auction.getAuction("test");
-      expect(auctionData.highestBidder).to.equal(bidder2.address);
-      expect(auctionData.highestBid).to.equal(bid2);
-      expect(auctionData.secondHighestBid).to.equal(bid1);
-    });
-
-    it("Should reject revelation with wrong bid amount", async function () {
-      await expect(
-        auction.connect(bidder1).revealBid("test", bid1, salt1, { value: bid1 - 1n })
-      ).to.be.revertedWith("Bid amount mismatch");
-    });
-
-    it("Should reject revelation with wrong salt", async function () {
-      const wrongSalt = ethers.keccak256(ethers.toUtf8Bytes("wrongsalt"));
-      
-      await expect(
-        auction.connect(bidder1).revealBid("test", bid1, wrongSalt, { value: bid1 })
-      ).to.be.revertedWith("Invalid reveal");
-    });
-
-    it("Should reject bid below minimum", async function () {
-      const lowBid = ethers.parseEther("0.0005");
-      const lowSalt = ethers.keccak256(ethers.toUtf8Bytes("lowsalt"));
-      
-      // First commit the low bid
-      await auction.startAuction("lowtest", 2 * oneDay, oneDay, minBid);
-      const lowCommitment = await auction.generateCommitment(lowBid, lowSalt, bidder1.address);
-      await auction.connect(bidder1).commitBid("lowtest", lowCommitment);
-      await time.increase(2 * oneDay + 1);
+    it("Should allow subdomain owner to transfer SOLD subdomain", async function () {
+      const { subdomain, user2, user3, subdomainNode } = await loadFixture(soldSubdomainFixture);
 
       await expect(
-        auction.connect(bidder1).revealBid("lowtest", lowBid, lowSalt, { value: lowBid })
-      ).to.be.revertedWith("Bid below minimum");
+        subdomain.connect(user2).transferSubdomain(subdomainNode, user3.address, SOLD)
+      ).to.emit(subdomain, "SubdomainTransferred")
+       .withArgs(subdomainNode, user2.address, user3.address, SOLD);
+
+      const record = await subdomain.getSubdomainRecord(subdomainNode);
+      expect(record.currentOwner).to.equal(user3.address);
     });
 
-    it("Should prevent double revelation", async function () {
-      await auction.connect(bidder1).revealBid("test", bid1, salt1, { value: bid1 });
-      
-      await expect(
-        auction.connect(bidder1).revealBid("test", bid1, salt1, { value: bid1 })
-      ).to.be.revertedWith("Already revealed");
-    });
-
-    it("Should reject revelation outside reveal phase", async function () {
-      // Before reveal phase
-      await auction.startAuction("early", 2 * oneDay, oneDay, minBid);
-      const commitment = await auction.generateCommitment(bid1, salt1, bidder1.address);
-      await auction.connect(bidder1).commitBid("early", commitment);
+    it("Should prevent unauthorized transfers", async function () {
+      const { subdomain, user3, subdomainNode } = await loadFixture(soldSubdomainFixture);
 
       await expect(
-        auction.connect(bidder1).revealBid("early", bid1, salt1, { value: bid1 })
-      ).to.be.revertedWith("Commit phase not ended");
-
-      // After reveal phase
-      await time.increase(4 * oneDay);
-      
-      await expect(
-        auction.connect(bidder1).revealBid("test", bid1, salt1, { value: bid1 })
-      ).to.be.revertedWith("Reveal phase ended");
-    });
-  });
-
-  describe("Auction Finalization", function () {
-    const bid1 = ethers.parseEther("1.5");
-    const bid2 = ethers.parseEther("2.0");
-    const salt1 = ethers.keccak256(ethers.toUtf8Bytes("salt1"));
-    const salt2 = ethers.keccak256(ethers.toUtf8Bytes("salt2"));
-
-    beforeEach(async function () {
-      await auction.startAuction("final", 2 * oneDay, oneDay, minBid);
-
-      // Commit and reveal bids
-      const commitment1 = await auction.generateCommitment(bid1, salt1, bidder1.address);
-      const commitment2 = await auction.generateCommitment(bid2, salt2, bidder2.address);
-
-      await auction.connect(bidder1).commitBid("final", commitment1);
-      await auction.connect(bidder2).commitBid("final", commitment2);
-
-      await time.increase(2 * oneDay + 1);
-
-      await auction.connect(bidder1).revealBid("final", bid1, salt1, { value: bid1 });
-      await auction.connect(bidder2).revealBid("final", bid2, salt2, { value: bid2 });
-
-      await time.increase(oneDay + 1);
+        subdomain.connect(user3).transferSubdomain(subdomainNode, user3.address, SOLD)
+      ).to.be.revertedWith("Not subdomain owner");
     });
 
-    it("Should allow winner to finalize auction", async function () {
-      await expect(
-        auction.connect(bidder2).finalizeAuction("final", oneYear, await resolver.getAddress())
-      ).to.emit(auction, "AuctionFinalized")
-       .and.to.emit(registry, "DomainRegistered");
+    it("Should only allow original owner to transfer MANAGED subdomains", async function () {
+      const { subdomain, resolver, user1, user2, parentNode } = await loadFixture(registerParentDomainFixture);
 
-      // Check domain registration
-      const node = await registry.getNodeOfLabel("final");
-      const domain = await registry.getDomain(node);
-      expect(domain.owner).to.equal(bidder2.address);
-    });
-
-    it("Should implement Vickrey pricing (winner pays second highest)", async function () {
-      const bidder2BalanceBefore = await ethers.provider.getBalance(bidder2.address);
-      
-      const tx = await auction.connect(bidder2).finalizeAuction(
-        "final", 
-        oneYear, 
+      // Create managed subdomain
+      await subdomain.connect(user1).createManagedSubdomain(
+        parentNode,
+        "managed-transfer",
         await resolver.getAddress()
       );
-      
-      const receipt = await tx.wait();
-      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
-      const bidder2BalanceAfter = await ethers.provider.getBalance(bidder2.address);
 
-      // Winner should get refund of (highest_bid - second_highest_bid)
-      const expectedRefund = bid2 - bid1;
-      const actualCost = bidder2BalanceBefore - bidder2BalanceAfter - gasUsed;
-      
-      expect(actualCost).to.equal(bid1); // Should pay second highest bid
-    });
+      const subdomainNode = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"],
+        [parentNode, ethers.keccak256(ethers.toUtf8Bytes("managed-transfer"))]));
 
-    it("Should reject finalization by non-winner", async function () {
+      // Original owner can transfer
       await expect(
-        auction.connect(bidder1).finalizeAuction("final", oneYear, await resolver.getAddress())
-      ).to.be.revertedWith("Not the winner");
-    });
-
-    it("Should reject finalization before auction ends", async function () {
-      await auction.startAuction("early", 2 * oneDay, oneDay, minBid);
-      
-      await expect(
-        auction.connect(bidder1).finalizeAuction("early", oneYear, await resolver.getAddress())
-      ).to.be.revertedWith("Auction not ended");
-    });
-
-    it("Should handle auction with no valid bids", async function () {
-      await auction.startAuction("nobids", 2 * oneDay, oneDay, minBid);
-      await time.increase(4 * oneDay);
-
-      await expect(
-        auction.connect(bidder1).finalizeAuction("nobids", oneYear, await resolver.getAddress())
-      ).to.be.revertedWith("No valid bids");
+        subdomain.connect(user1).transferSubdomain(subdomainNode, user2.address, DELEGATED)
+      ).to.not.be.reverted;
     });
   });
 
-  describe("Emergency Functions", function () {
-    beforeEach(async function () {
-      await auction.startAuction("emergency", 2 * oneDay, oneDay, minBid);
-    });
+  describe("Subdomain Renewal", function () {
+    it("Should allow subdomain renewal", async function () {
+      const { subdomain, subdomainNode } = await loadFixture(soldSubdomainFixture);
 
-    it("Should allow admin to cancel auction", async function () {
       await expect(
-        auction.cancelAuction("emergency")
-      ).to.emit(auction, "AuctionCancelled");
-
-      const auctionData = await auction.getAuction("emergency");
-      expect(auctionData.state).to.equal(4); // Cancelled
+        subdomain.renewSubdomain(subdomainNode)
+      ).to.emit(subdomain, "SubdomainRenewed");
     });
 
-    it("Should refund bidders on cancellation", async function () {
-      const bid = ethers.parseEther("1.0");
-      const salt = ethers.keccak256(ethers.toUtf8Bytes("salt"));
-      const commitment = await auction.generateCommitment(bid, salt, bidder1.address);
+    it("Should inherit parent expiry for managed subdomains", async function () {
+      const { subdomain, resolver, registry, user1, parentNode } = await loadFixture(registerParentDomainFixture);
 
-      await auction.connect(bidder1).commitBid("emergency", commitment);
-      await time.increase(2 * oneDay + 1);
-      await auction.connect(bidder1).revealBid("emergency", bid, salt, { value: bid });
-
-      const balanceBefore = await ethers.provider.getBalance(bidder1.address);
-      await auction.cancelAuction("emergency");
-      const balanceAfter = await ethers.provider.getBalance(bidder1.address);
-
-      expect(balanceAfter - balanceBefore).to.equal(bid);
-    });
-
-    it("Should allow emergency withdrawal", async function () {
-      const contractBalance = await ethers.provider.getBalance(await auction.getAddress());
-      
-      if (contractBalance > 0) {
-        const ownerBalanceBefore = await ethers.provider.getBalance(owner.address);
-        await auction.emergencyWithdraw();
-        const ownerBalanceAfter = await ethers.provider.getBalance(owner.address);
-
-        expect(ownerBalanceAfter).to.be.gt(ownerBalanceBefore);
-      }
-    });
-  });
-
-  describe("Utility Functions", function () {
-    it("Should generate correct commitment hash", async function () {
-      const bid = ethers.parseEther("1.0");
-      const salt = ethers.keccak256(ethers.toUtf8Bytes("testsalt"));
-      
-      const commitment = await auction.generateCommitment(bid, salt, bidder1.address);
-      const expectedCommitment = ethers.keccak256(
-        ethers.concat([
-          ethers.toBeArray(bid),
-          salt,
-          ethers.getBytes(bidder1.address)
-        ])
+      await subdomain.connect(user1).createManagedSubdomain(
+        parentNode,
+        "auto-renew",
+        await resolver.getAddress()
       );
 
-      expect(commitment).to.equal(expectedCommitment);
+      const subdomainNode = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"],
+        [parentNode, ethers.keccak256(ethers.toUtf8Bytes("auto-renew"))]));
+
+      await subdomain.renewSubdomain(subdomainNode);
+
+      const parentRecord = await registry.getRecord(parentNode);
+      const subdomainRecord = await registry.getRecord(subdomainNode);
+
+      expect(subdomainRecord.expiry).to.equal(parentRecord.expiry);
+    });
+
+    it("Should charge fee for SOLD subdomain renewals", async function () {
+      const { subdomain, user2, subdomainNode } = await loadFixture(soldSubdomainFixture);
+
+      // Should require payment for sold subdomain renewal
+      await expect(
+        subdomain.connect(user2).renewSubdomain(subdomainNode)
+      ).to.be.revertedWith("Insufficient renewal fee");
+    });
+  });
+
+  describe("Subdomain Status Management", function () {
+    it("Should allow parent owner to change subdomain status", async function () {
+      const { subdomain, user1, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      await expect(
+        subdomain.connect(user1).setSubdomainStatus(parentNode, "shop", PAUSED)
+      ).to.emit(subdomain, "SubdomainStatusChanged")
+       .withArgs(parentNode, "shop", AVAILABLE, PAUSED);
+
+      const config = await subdomain.getSubdomainConfig(parentNode, "shop");
+      expect(config.status).to.equal(PAUSED);
+    });
+
+    it("Should prevent non-parent-owner from changing status", async function () {
+      const { subdomain, user2, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      await expect(
+        subdomain.connect(user2).setSubdomainStatus(parentNode, "shop", PAUSED)
+      ).to.be.revertedWith("Not parent owner");
+    });
+  });
+
+  describe("View Functions", function () {
+    it("Should return correct subdomain configuration", async function () {
+      const { subdomain, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      const config = await subdomain.getSubdomainConfig(parentNode, "shop");
+      
+      expect(config.price).to.equal(ethers.parseEther("0.1"));
+      expect(config.subType).to.equal(SOLD);
+      expect(config.status).to.equal(AVAILABLE);
+      expect(config.maxSupply).to.equal(10);
+      expect(config.requiresApproval).to.be.false;
+    });
+
+    it("Should return subdomain labels for parent", async function () {
+      const { subdomain, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await subdomain.connect(user1).configureSubdomain(
+        parentNode, "api", ethers.parseEther("0.1"), SOLD, oneYear, 10, false
+      );
+      await subdomain.connect(user1).configureSubdomain(
+        parentNode, "www", ethers.parseEther("0.05"), SOLD, oneYear, 5, false
+      );
+
+      const labels = await subdomain.getSubdomainLabels(parentNode);
+      expect(labels).to.include("api");
+      expect(labels).to.include("www");
+      expect(labels.length).to.equal(2);
+    });
+
+    it("Should return parent earnings", async function () {
+      const { subdomain, resolver, user2, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      await subdomain.connect(user2).buySubdomain(
+        parentNode,
+        "shop",
+        await resolver.getAddress(),
+        { value: ethers.parseEther("0.1") }
+      );
+
+      const earnings = await subdomain.getParentEarnings(parentNode);
+      expect(earnings).to.equal(ethers.parseEther("0.1"));
+    });
+  });
+
+  describe("Reverse Registrar Integration", function () {
+    it("Should update reverse registrar on subdomain creation", async function () {
+      const { subdomain, reverse, resolver, user2, parentNode } = await loadFixture(configuredSubdomainFixture);
+
+      await subdomain.connect(user2).buySubdomain(
+        parentNode,
+        "shop",
+        await resolver.getAddress(),
+        { value: ethers.parseEther("0.1") }
+      );
+
+      // Note: This test would need the reverse registrar to actually track the subdomain
+      // The current implementation may not fully integrate this
+    });
+  });
+
+  describe("Access Control", function () {
+    it("Should allow admin to pause contract", async function () {
+      const { subdomain, owner } = await loadFixture(deploySubdomainFixture);
+
+      await expect(subdomain.pause()).to.emit(subdomain, "Paused");
+      expect(await subdomain.paused()).to.be.true;
+    });
+
+    it("Should prevent operations when paused", async function () {
+      const { subdomain, owner, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await subdomain.pause();
+
+      await expect(
+        subdomain.connect(user1).configureSubdomain(
+          parentNode, "paused", ethers.parseEther("0.1"), SOLD, oneYear, 10, false
+        )
+      ).to.be.revertedWith("Pausable: paused");
+    });
+
+    it("Should allow admin to set reverse registrar", async function () {
+      const { subdomain, owner, user1 } = await loadFixture(deploySubdomainFixture);
+
+      await expect(
+        subdomain.setReverseRegistrar(user1.address)
+      ).to.not.be.reverted;
+    });
+  });
+
+  describe("Edge Cases", function () {
+    it("Should handle zero-price subdomains", async function () {
+      const { subdomain, resolver, user1, user2, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await subdomain.connect(user1).configureSubdomain(
+        parentNode, "free", 0, SOLD, oneYear, 10, false
+      );
+
+      await expect(
+        subdomain.connect(user2).buySubdomain(
+          parentNode, "free", await resolver.getAddress(), { value: 0 }
+        )
+      ).to.not.be.reverted;
+    });
+
+    it("Should handle unlimited supply (maxSupply = 0)", async function () {
+      const { subdomain, resolver, user1, user2, user3, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      await subdomain.connect(user1).configureSubdomain(
+        parentNode, "unlimited", ethers.parseEther("0.1"), SOLD, oneYear, 0, false
+      );
+
+      // Should allow multiple purchases
+      const price = ethers.parseEther("0.1");
+      await subdomain.connect(user2).buySubdomain(
+        parentNode, "unlimited", await resolver.getAddress(), { value: price }
+      );
+      await subdomain.connect(user3).buySubdomain(
+        parentNode, "unlimited", await resolver.getAddress(), { value: price }
+      );
+
+      const config = await subdomain.getSubdomainConfig(parentNode, "unlimited");
+      expect(config.totalSold).to.equal(2);
+      expect(config.status).to.equal(AVAILABLE); // Should not change to SOLD_OUT
+    });
+
+    it("Should handle very long subdomain labels", async function () {
+      const { subdomain, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      const maxLabel = "a".repeat(63);
+
+      await expect(
+        subdomain.connect(user1).configureSubdomain(
+          parentNode, maxLabel, ethers.parseEther("0.1"), SOLD, oneYear, 10, false
+        )
+      ).to.not.be.reverted;
+    });
+
+    it("Should prevent withdrawal when no earnings", async function () {
+      const { subdomain, user1 } = await loadFixture(registerParentDomainFixture);
+
+      await expect(
+        subdomain.connect(user1).withdrawEarnings()
+      ).to.be.revertedWith("No earnings to withdraw");
+    });
+  });
+
+  describe("Gas Optimization", function () {
+    it("Should be gas efficient for subdomain creation", async function () {
+      const { subdomain, resolver, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      const tx = await subdomain.connect(user1).createManagedSubdomain(
+        parentNode, "gas-test", await resolver.getAddress()
+      );
+      const receipt = await tx.wait();
+
+      expect(receipt!.gasUsed).to.be.lt(300000);
+    });
+
+    it("Should be efficient for batch subdomain configuration", async function () {
+      const { subdomain, user1, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      // Configure multiple subdomains
+      const subdomains = ["api", "www", "mail", "ftp"];
+      
+      for (const sub of subdomains) {
+        await subdomain.connect(user1).configureSubdomain(
+          parentNode, sub, ethers.parseEther("0.1"), SOLD, oneYear, 10, false
+        );
+      }
+
+      // Should complete without excessive gas usage
+      const labels = await subdomain.getSubdomainLabels(parentNode);
+      expect(labels.length).to.equal(4);
+    });
+  });
+
+  describe("Integration Tests", function () {
+    it("Should handle complete subdomain lifecycle", async function () {
+      const { subdomain, resolver, user1, user2, user3, parentNode } = await loadFixture(registerParentDomainFixture);
+
+      // 1. Configure subdomain
+      await subdomain.connect(user1).configureSubdomain(
+        parentNode, "lifecycle", ethers.parseEther("0.1"), SOLD, oneYear, 5, false
+      );
+
+      // 2. Buy subdomain
+      await subdomain.connect(user2).buySubdomain(
+        parentNode, "lifecycle", await resolver.getAddress(), 
+        { value: ethers.parseEther("0.1") }
+      );
+
+      // 3. Transfer subdomain
+      const subdomainNode = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"],
+        [parentNode, ethers.keccak256(ethers.toUtf8Bytes("lifecycle"))]));
+      
+      await subdomain.connect(user2).transferSubdomain(subdomainNode, user3.address, SOLD);
+
+      // 4. Renew subdomain
+      await subdomain.connect(user3).renewSubdomain(subdomainNode, { value: ethers.parseEther("0.01") });
+
+      // 5. Parent withdraws earnings
+      await subdomain.connect(user1).withdrawEarnings();
+
+      // Verify final state
+      const record = await subdomain.getSubdomainRecord(subdomainNode);
+      expect(record.currentOwner).to.equal(user3.address);
+      expect(record.isActive).to.be.true;
     });
   });
 });

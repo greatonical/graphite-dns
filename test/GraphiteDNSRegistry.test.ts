@@ -1,274 +1,439 @@
+// test/GraphiteDNSRegistry.test.ts
 import { expect } from "chai";
 import { ethers } from "hardhat";
+import { time, loadFixture } from "@nomicfoundation/hardhat-network-helpers";
+import type { GraphiteDNSRegistry, GraphiteResolver } from "../typechain-types";
 
-describe("GraphiteDNSRegistry - Fixed Version", function () {
-  let registry: any;
-  let resolver: any;
-  let owner: any;
-  let addr1: any;
-  let addr2: any;
-  let addr3: any;
+describe("GraphiteDNSRegistry", function () {
+  // Test constants
+  const ZERO_ADDRESS = ethers.ZeroAddress;
+  const ZERO_HASH = ethers.ZeroHash;
+  const oneYear = 365 * 24 * 60 * 60;
+  const oneDay = 24 * 60 * 60;
+  const gracePeriod = 90 * 24 * 60 * 60;
 
-  const oneYear = 365 * 24 * 3600;
-  const twoYears = 2 * oneYear;
-  const threeYears = 3 * oneYear;
+  async function deployRegistryFixture() {
+    const [owner, user1, user2, user3, registrar] = await ethers.getSigners();
 
-  beforeEach(async function () {
-    [owner, addr1, addr2, addr3] = await ethers.getSigners();
-
-    // Deploy resolver first (with zero address temporarily)
+    // Deploy resolver first (placeholder)
     const ResolverFactory = await ethers.getContractFactory("GraphiteResolver");
-    resolver = await ResolverFactory.deploy(ethers.ZeroAddress);
-    await resolver.waitForDeployment();
+    const resolver = await ResolverFactory.deploy(ZERO_ADDRESS);
 
-    // Deploy registry with resolver
+    // Deploy registry
     const RegistryFactory = await ethers.getContractFactory("GraphiteDNSRegistry");
-    registry = await RegistryFactory.deploy(await resolver.getAddress());
-    await registry.waitForDeployment();
+    const registry = await RegistryFactory.deploy(await resolver.getAddress(), "atgraphite");
 
-    // Deploy final resolver with registry address
+    // Deploy actual resolver with registry address
     const finalResolver = await ResolverFactory.deploy(await registry.getAddress());
-    await finalResolver.waitForDeployment();
-    resolver = finalResolver;
-  });
+
+    // Update registry's default resolver
+    await registry.setDefaultResolver(await finalResolver.getAddress());
+
+    const TLD_NODE = await registry.TLD_NODE();
+
+    return {
+      registry,
+      resolver: finalResolver,
+      owner,
+      user1,
+      user2,
+      user3,
+      registrar,
+      TLD_NODE
+    };
+  }
 
   describe("Deployment", function () {
-    it("Should set the correct admin roles", async function () {
-      const adminRole = await registry.DEFAULT_ADMIN_ROLE();
-      expect(await registry.hasRole(adminRole, owner.address)).to.be.true;
+    it("Should deploy with correct initial state", async function () {
+      const { registry, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      expect(await registry.name()).to.equal("Graphite DNS");
+      expect(await registry.symbol()).to.equal("GDNS");
+      expect(await registry.hasRole(await registry.DEFAULT_ADMIN_ROLE(), owner.address)).to.be.true;
+      expect(await registry.TLD_NODE()).to.equal(TLD_NODE);
     });
 
-    it("Should bootstrap .atgraphite TLD", async function () {
-      const tldNode = await registry.TLD_NODE();
-      const domain = await registry.getDomain(tldNode);
-      expect(domain.owner).to.equal(await registry.getAddress());
-      // Check for uint64 max value instead of uint256 max
-      expect(domain.expiry).to.equal(18446744073709551615n); // type(uint64).max
+    it("Should create TLD domain on deployment", async function () {
+      const { registry, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      const tldRecord = await registry.getRecord(TLD_NODE);
+      expect(tldRecord.owner).to.equal(owner.address);
+      expect(tldRecord.exists).to.be.true;
+      expect(await registry.ownerOf(1)).to.equal(owner.address); // First token is TLD
     });
 
-    it("Should set correct initial duration multipliers", async function () {
-      expect(await registry.durationMultipliers(1)).to.equal(10000); // 100%
-      expect(await registry.durationMultipliers(2)).to.equal(9500);  // 95%
-      expect(await registry.durationMultipliers(3)).to.equal(9000);  // 90%
-    });
-  });
+    it("Should set correct length premiums", async function () {
+      const { registry } = await loadFixture(deployRegistryFixture);
 
-  describe("Duration-Based Pricing", function () {
-    it("Should calculate correct price for different durations", async function () {
-      const basePrice = await registry["priceOf(string,uint64)"]("test", oneYear);
-      const twoYearPrice = await registry["priceOf(string,uint64)"]("test", twoYears);
-      const threeYearPrice = await registry["priceOf(string,uint64)"]("test", threeYears);
-
-      // 2 years should be 2 * 95% = 1.9x base price
-      expect(twoYearPrice).to.equal(basePrice * 2n * 9500n / 10000n);
-      
-      // 3 years should be 3 * 90% = 2.7x base price
-      expect(threeYearPrice).to.equal(basePrice * 3n * 9000n / 10000n);
-    });
-
-    it("Should allow admin to set duration multipliers", async function () {
-      await registry.setDurationMultiplier(5, 8000); // 5 years = 80%
-      expect(await registry.durationMultipliers(5)).to.equal(8000);
-
-      const basePrice = await registry["priceOf(string,uint64)"]("test", oneYear);
-      const fiveYearPrice = await registry["priceOf(string,uint64)"]("test", 5 * oneYear);
-      expect(fiveYearPrice).to.equal(basePrice * 5n * 8000n / 10000n);
-    });
-
-    it("Should revert on invalid multipliers", async function () {
-      await expect(
-        registry.setDurationMultiplier(1, 0)
-      ).to.be.revertedWith("Invalid multiplier");
-
-      await expect(
-        registry.setDurationMultiplier(1, 25000) // > 200%
-      ).to.be.revertedWith("Invalid multiplier");
-    });
-
-    it("Should support legacy single-parameter priceOf", async function () {
-      const legacyPrice = await registry["priceOf(string)"]("test");
-      const modernPrice = await registry["priceOf(string,uint64)"]("test", oneYear);
-      
-      expect(legacyPrice).to.equal(modernPrice);
+      expect(await registry.lengthPremium(1)).to.equal(ethers.parseEther("1"));
+      expect(await registry.lengthPremium(2)).to.equal(ethers.parseEther("0.5"));
+      expect(await registry.lengthPremium(3)).to.equal(ethers.parseEther("0.1"));
+      expect(await registry.lengthPremium(4)).to.equal(ethers.parseEther("0.05"));
     });
   });
 
-  describe("Domain Registration", function () {
-    it("Should register domain with correct duration pricing", async function () {
-      const price = await registry["priceOf(string,uint64)"]("alice", twoYears);
+  describe("Registration", function () {
+    it("Should register domain with correct parameters", async function () {
+      const { registry, resolver, user1, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      const price = await registry.priceOf("alice");
       
       await expect(
-        registry.connect(addr1).buyFixedPrice("alice", await resolver.getAddress(), twoYears, { value: price })
+        registry.connect(user1).register(
+          "alice",
+          user1.address,
+          oneYear,
+          await resolver.getAddress(),
+          TLD_NODE,
+          { value: price }
+        )
       ).to.emit(registry, "DomainRegistered")
-       .and.to.emit(registry, "NamePurchased");
+       .withArgs(
+         ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], 
+         [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("alice"))])),
+         "alice",
+         user1.address,
+         await time.latest() + oneYear,
+         price
+       );
 
-      const tokenId = 1n;
-      expect(await registry.ownerOf(tokenId)).to.equal(addr1.address);
+      const node = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], 
+        [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("alice"))]));
       
-      // Check domain mapping
-      const node = await registry.getNodeOfToken(tokenId);
-      const domain = await registry.getDomain(node);
-      expect(domain.owner).to.equal(addr1.address);
-      expect(domain.expiry).to.be.closeTo(
-        BigInt(Math.floor(Date.now() / 1000)) + BigInt(twoYears),
-        100n
-      );
+      const record = await registry.getRecord(node);
+      expect(record.owner).to.equal(user1.address);
+      expect(record.exists).to.be.true;
     });
 
-    it("Should refund overpayment", async function () {
-      const price = await registry["priceOf(string,uint64)"]("bob", oneYear);
-      const overpayment = ethers.parseEther("1.0");
-      const totalPayment = price + overpayment;
+    it("Should fail registration without REGISTRAR_ROLE", async function () {
+      const { registry, resolver, user1, TLD_NODE } = await loadFixture(deployRegistryFixture);
 
-      const balanceBefore = await ethers.provider.getBalance(addr1.address);
-      
-      const tx = await registry.connect(addr1).buyFixedPrice(
-        "bob", 
-        await resolver.getAddress(), 
-        oneYear, 
-        { value: totalPayment }
-      );
-      
-      const receipt = await tx.wait();
-      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
-      const balanceAfter = await ethers.provider.getBalance(addr1.address);
-
-      // Should only pay the actual price + gas
-      expect(balanceBefore - balanceAfter).to.equal(price + gasUsed);
+      await expect(
+        registry.connect(user1).register(
+          "alice",
+          user1.address,
+          oneYear,
+          await resolver.getAddress(),
+          TLD_NODE
+        )
+      ).to.be.revertedWith("AccessControl:");
     });
 
-    it("Should reject insufficient payment", async function () {
-      const price = await registry["priceOf(string,uint64)"]("charlie", oneYear);
+    it("Should fail registration with insufficient payment", async function () {
+      const { registry, resolver, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      const price = await registry.priceOf("alice");
       
       await expect(
-        registry.connect(addr1).buyFixedPrice(
-          "charlie", 
-          await resolver.getAddress(), 
-          oneYear, 
+        registry.register(
+          "alice",
+          owner.address,
+          oneYear,
+          await resolver.getAddress(),
+          TLD_NODE,
           { value: price - 1n }
         )
       ).to.be.revertedWith("Insufficient payment");
     });
 
+    it("Should refund excess payment", async function () {
+      const { registry, resolver, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      const price = await registry.priceOf("alice");
+      const excess = ethers.parseEther("1");
+      const initialBalance = await ethers.provider.getBalance(owner.address);
+
+      const tx = await registry.register(
+        "alice",
+        owner.address,
+        oneYear,
+        await resolver.getAddress(),
+        TLD_NODE,
+        { value: price + excess }
+      );
+
+      const receipt = await tx.wait();
+      const gasUsed = receipt!.gasUsed * receipt!.gasPrice;
+      const finalBalance = await ethers.provider.getBalance(owner.address);
+
+      // Should only pay the actual price plus gas
+      expect(finalBalance).to.be.closeTo(
+        initialBalance - price - gasUsed,
+        ethers.parseEther("0.001") // Small tolerance for gas estimation differences
+      );
+    });
+
+    it("Should prevent registration of invalid names", async function () {
+      const { registry, resolver, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      // Empty name
+      await expect(
+        registry.register("", owner.address, oneYear, await resolver.getAddress(), TLD_NODE)
+      ).to.be.revertedWith("Invalid name length");
+
+      // Too long name
+      const longName = "a".repeat(64);
+      await expect(
+        registry.register(longName, owner.address, oneYear, await resolver.getAddress(), TLD_NODE)
+      ).to.be.revertedWith("Invalid name length");
+
+      // Invalid characters
+      await expect(
+        registry.register("alice!", owner.address, oneYear, await resolver.getAddress(), TLD_NODE)
+      ).to.be.revertedWith("Invalid name format");
+    });
+
     it("Should prevent registration of unavailable domains", async function () {
-      const price = await registry["priceOf(string,uint64)"]("taken", oneYear);
-      
-      // First registration should succeed
-      await registry.connect(addr1).buyFixedPrice(
-        "taken", 
-        await resolver.getAddress(), 
-        oneYear, 
+      const { registry, resolver, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      const price = await registry.priceOf("alice");
+
+      // Register domain first
+      await registry.register(
+        "alice",
+        owner.address,
+        oneYear,
+        await resolver.getAddress(),
+        TLD_NODE,
         { value: price }
       );
 
-      // Second registration should fail
+      // Try to register again should fail
       await expect(
-        registry.connect(addr2).buyFixedPrice(
-          "taken", 
-          await resolver.getAddress(), 
-          oneYear, 
+        registry.register(
+          "alice",
+          owner.address,
+          oneYear,
+          await resolver.getAddress(),
+          TLD_NODE,
           { value: price }
         )
-      ).to.be.revertedWith("Domain not available");
+      ).to.be.revertedWith("Name not available");
     });
 
-    it("Should validate domain names", async function () {
-      const price = await registry["priceOf(string,uint64)"]("valid", oneYear);
-      
-      // Valid domain should work
-      await registry.connect(addr1).buyFixedPrice(
-        "valid123", 
-        await resolver.getAddress(), 
-        oneYear, 
-        { value: price }
-      );
+    it("Should enforce duration limits", async function () {
+      const { registry, resolver, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
 
-      // Invalid characters should fail (this would happen in _validateLabel)
+      const minDuration = 28 * 24 * 60 * 60; // 28 days
+      const maxDuration = 10 * 365 * 24 * 60 * 60; // 10 years
+
+      // Too short duration
       await expect(
-        registry.connect(addr1).buyFixedPrice(
-          "", // empty string
-          await resolver.getAddress(), 
-          oneYear, 
-          { value: price }
+        registry.register(
+          "short",
+          owner.address,
+          minDuration - 1,
+          await resolver.getAddress(),
+          TLD_NODE
         )
-      ).to.be.reverted;
+      ).to.be.revertedWith("Invalid duration");
+
+      // Too long duration
+      await expect(
+        registry.register(
+          "long",
+          owner.address,
+          maxDuration + 1,
+          await resolver.getAddress(),
+          TLD_NODE
+        )
+      ).to.be.revertedWith("Invalid duration");
     });
   });
 
-  describe("NFT Transfer Integration", function () {
-    let tokenId: bigint;
-    let node: string;
+  describe("Pricing", function () {
+    it("Should calculate correct base price", async function () {
+      const { registry } = await loadFixture(deployRegistryFixture);
 
-    beforeEach(async function () {
-      const price = await registry["priceOf(string,uint64)"]("nfttest", oneYear);
-      await registry.connect(addr1).buyFixedPrice(
-        "nfttest", 
-        await resolver.getAddress(), 
-        oneYear, 
-        { value: price }
-      );
-      tokenId = 1n;
-      node = await registry.getNodeOfToken(tokenId);
+      const baseFee = await registry.baseFee();
+      const maxLength = await registry.MAX_NAME_LENGTH();
+
+      // Check pricing for different lengths
+      const price5 = await registry.priceOf("alice"); // 5 chars
+      const price10 = await registry.priceOf("1234567890"); // 10 chars
+
+      expect(price5).to.be.gt(price10); // Shorter names cost more
     });
 
-    it("Should update domain ownership when NFT is transferred", async function () {
-      // Transfer NFT
+    it("Should apply length premiums correctly", async function () {
+      const { registry } = await loadFixture(deployRegistryFixture);
+
+      const price1 = await registry.priceOf("a");
+      const price2 = await registry.priceOf("ab"); 
+      const price3 = await registry.priceOf("abc");
+      const price5 = await registry.priceOf("alice");
+
+      // 1-char should be most expensive
+      expect(price1).to.be.gt(price2);
+      expect(price2).to.be.gt(price3);
+      expect(price3).to.be.gt(price5);
+    });
+
+    it("Should honor custom pricing", async function () {
+      const { registry, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      const customPrice = ethers.parseEther("10");
+      const node = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], 
+        [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("premium"))]));
+
+      await registry.setCustomPrice(node, customPrice);
+      
+      expect(await registry.priceOf("premium")).to.equal(customPrice);
+    });
+
+    it("Should calculate renewal pricing differently", async function () {
+      const { registry } = await loadFixture(deployRegistryFixture);
+
+      const registerPrice = await registry.priceOf("alice");
+      const renewalPrice = await registry.renewalPriceOf("alice", oneYear);
+
+      expect(renewalPrice).to.be.lt(registerPrice); // Renewals should be cheaper
+    });
+  });
+
+  describe("Domain Management", function () {
+    async function registerDomainFixture() {
+      const base = await loadFixture(deployRegistryFixture);
+      const { registry, resolver, user1, TLD_NODE } = base;
+
+      const price = await registry.priceOf("alice");
+      await registry.register(
+        "alice",
+        user1.address,
+        oneYear,
+        await resolver.getAddress(),
+        TLD_NODE,
+        { value: price }
+      );
+
+      const node = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], 
+        [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("alice"))]));
+
+      return { ...base, node };
+    }
+
+    it("Should allow owner to set resolver", async function () {
+      const { registry, user1, user2, node } = await loadFixture(registerDomainFixture);
+
       await expect(
-        registry.connect(addr1).transferFrom(addr1.address, addr2.address, tokenId)
+        registry.connect(user1).setResolver(node, user2.address)
+      ).to.emit(registry, "ResolverChanged")
+       .withArgs(node, user2.address);
+
+      const record = await registry.getRecord(node);
+      expect(record.resolver).to.equal(user2.address);
+    });
+
+    it("Should prevent non-owner from setting resolver", async function () {
+      const { registry, user2, node } = await loadFixture(registerDomainFixture);
+
+      await expect(
+        registry.connect(user2).setResolver(node, user2.address)
+      ).to.be.revertedWith("Not authorized");
+    });
+
+    it("Should prevent operations on expired domains", async function () {
+      const { registry, user1, node } = await loadFixture(registerDomainFixture);
+
+      // Fast forward past expiry
+      await time.increase(oneYear + 1);
+
+      await expect(
+        registry.connect(user1).setResolver(node, user1.address)
+      ).to.be.revertedWith("Domain expired");
+    });
+  });
+
+  describe("Renewal", function () {
+    async function expiredDomainFixture() {
+      const base = await loadFixture(registerDomainFixture);
+      const { registry, user1, node } = base;
+
+      // Fast forward to near expiry
+      await time.increase(oneYear - oneDay);
+
+      return { ...base };
+    }
+
+    it("Should allow domain renewal before expiry", async function () {
+      const { registry, user1, node } = await loadFixture(expiredDomainFixture);
+
+      const renewalCost = await registry.renewalPriceOf("alice", oneYear);
+      const oldRecord = await registry.getRecord(node);
+
+      await expect(
+        registry.connect(user1).renew(node, oneYear, { value: renewalCost })
+      ).to.emit(registry, "DomainRenewed");
+
+      const newRecord = await registry.getRecord(node);
+      expect(newRecord.expiry).to.be.gt(oldRecord.expiry);
+    });
+
+    it("Should allow renewal during grace period", async function () {
+      const { registry, user1, node } = await loadFixture(expiredDomainFixture);
+
+      // Fast forward past expiry but within grace period
+      await time.increase(oneDay * 2);
+
+      const renewalCost = await registry.renewalPriceOf("alice", oneYear);
+
+      await expect(
+        registry.connect(user1).renew(node, oneYear, { value: renewalCost })
+      ).to.not.be.reverted;
+    });
+
+    it("Should prevent renewal after grace period", async function () {
+      const { registry, user1, node } = await loadFixture(expiredDomainFixture);
+
+      // Fast forward past grace period
+      await time.increase(oneDay * 2 + gracePeriod);
+
+      const renewalCost = await registry.renewalPriceOf("alice", oneYear);
+
+      await expect(
+        registry.connect(user1).renew(node, oneYear, { value: renewalCost })
+      ).to.be.revertedWith("Grace period expired");
+    });
+
+    it("Should prevent non-owner from renewing", async function () {
+      const { registry, user2, node } = await loadFixture(expiredDomainFixture);
+
+      const renewalCost = await registry.renewalPriceOf("alice", oneYear);
+
+      await expect(
+        registry.connect(user2).renew(node, oneYear, { value: renewalCost })
+      ).to.be.revertedWith("Not authorized to renew");
+    });
+  });
+
+  describe("Transfers", function () {
+    it("Should transfer domain ownership", async function () {
+      const { registry, user1, user2, node } = await loadFixture(registerDomainFixture);
+
+      const tokenId = 2; // Second token (first is TLD)
+
+      await expect(
+        registry.connect(user1).transferFrom(user1.address, user2.address, tokenId)
       ).to.emit(registry, "DomainTransferred")
-       .withArgs(node, addr1.address, addr2.address);
+       .withArgs(node, user1.address, user2.address);
 
-      // Check domain ownership updated
-      const domain = await registry.getDomain(node);
-      expect(domain.owner).to.equal(addr2.address);
+      expect(await registry.ownerOf(tokenId)).to.equal(user2.address);
       
-      // Check NFT ownership
-      expect(await registry.ownerOf(tokenId)).to.equal(addr2.address);
+      const record = await registry.getRecord(node);
+      expect(record.owner).to.equal(user2.address);
     });
 
-    it("Should maintain bidirectional token-node mapping", async function () {
-      expect(await registry.getNodeOfToken(tokenId)).to.equal(node);
-      expect(await registry.getTokenOfNode(node)).to.equal(tokenId);
-    });
+    it("Should support meta-transactions for transfers", async function () {
+      const { registry, user1, user2, node } = await loadFixture(registerDomainFixture);
 
-    it("Should work with marketplace transfers", async function () {
-      // Approve marketplace (simulated by addr3)
-      await registry.connect(addr1).approve(addr3.address, tokenId);
-      
-      // Marketplace transfers on behalf of user
-      await registry.connect(addr3).transferFrom(addr1.address, addr2.address, tokenId);
-      
-      // Verify ownership transfer
-      const domain = await registry.getDomain(node);
-      expect(domain.owner).to.equal(addr2.address);
-      expect(await registry.ownerOf(tokenId)).to.equal(addr2.address);
-    });
-  });
+      const nonce = await registry.nonces(user1.address);
+      const deadline = await time.latest() + 3600;
 
-  describe("Meta-Transactions", function () {
-    it("Should allow meta-transfer with valid signature", async function () {
-      // Register domain
-      const price = await registry["priceOf(string,uint64)"]("metatest", oneYear);
-      await registry.connect(addr1).buyFixedPrice(
-        "metatest", 
-        await resolver.getAddress(), 
-        oneYear, 
-        { value: price }
-      );
-
-      const node = await registry.getNodeOfToken(1n);
-      const nonce = 1n;
-      const deadline = BigInt(Math.floor(Date.now() / 1000)) + 3600n; // 1 hour from now
-
-      // Get current block timestamp and add buffer
-      const latestBlock = await ethers.provider.getBlock('latest');
-      const safeDeadline = BigInt(latestBlock!.timestamp) + 3600n;
-
-      // Create signature (simplified - in real implementation you'd use proper EIP-712 signing)
+      // Create signature
       const domain = {
-        name: "GraphiteDNS",
+        name: "GraphiteDNSRegistry",
         version: "1",
-        chainId: (await ethers.provider.getNetwork()).chainId,
+        chainId: 31337,
         verifyingContract: await registry.getAddress()
       };
 
@@ -283,285 +448,243 @@ describe("GraphiteDNSRegistry - Fixed Version", function () {
       };
 
       const value = {
-        node: node,
-        from: addr1.address,
-        to: addr2.address,
-        nonce: nonce,
-        deadline: safeDeadline
+        node,
+        from: user1.address,
+        to: user2.address,
+        nonce,
+        deadline
       };
 
-      const signature = await addr1.signTypedData(domain, types, value);
+      const signature = await user1.signTypedData(domain, types, value);
 
-      // Execute meta-transfer
       await expect(
-        registry.transferWithSig(node, addr1.address, addr2.address, nonce, safeDeadline, signature)
+        registry.transferWithSig(node, user1.address, user2.address, nonce, deadline, signature)
       ).to.emit(registry, "DomainTransferred");
-
-      // Verify transfer
-      expect(await registry.ownerOf(1n)).to.equal(addr2.address);
-    });
-
-    it("Should reject expired signatures", async function () {
-      const price = await registry["priceOf(string,uint64)"]("expired", oneYear);
-      await registry.connect(addr1).buyFixedPrice(
-        "expired", 
-        await resolver.getAddress(), 
-        oneYear, 
-        { value: price }
-      );
-
-      const node = await registry.getNodeOfToken(2n);
-      const pastDeadline = BigInt(Math.floor(Date.now() / 1000)) - 3600n; // 1 hour ago
-
-      await expect(
-        registry.transferWithSig(node, addr1.address, addr2.address, 1n, pastDeadline, "0x00")
-      ).to.be.revertedWith("Signature expired");
-    });
-  });
-
-  describe("Fixed Price Management", function () {
-    it("Should allow admin to set fixed prices", async function () {
-      await registry.setFixedPrice("premium", ethers.parseEther("10.0"));
-      
-      const price = await registry["priceOf(string,uint64)"]("premium", oneYear);
-      expect(price).to.equal(ethers.parseEther("10.0"));
-    });
-
-    it("Should apply duration pricing to fixed prices", async function () {
-      await registry.setFixedPrice("premium", ethers.parseEther("1.0"));
-      
-      const oneYearPrice = await registry["priceOf(string,uint64)"]("premium", oneYear);
-      const twoYearPrice = await registry["priceOf(string,uint64)"]("premium", twoYears);
-      
-      expect(oneYearPrice).to.equal(ethers.parseEther("1.0"));
-      expect(twoYearPrice).to.equal(ethers.parseEther("1.9")); // 2 * 95%
-    });
-
-    it("Should allow purchasing fixed price domains", async function () {
-      await registry.setFixedPrice("expensive", ethers.parseEther("5.0"));
-      const price = await registry["priceOf(string,uint64)"]("expensive", oneYear);
-      
-      await registry.connect(addr1).buyFixedPrice(
-        "expensive",
-        await resolver.getAddress(),
-        oneYear,
-        { value: price }
-      );
-
-      expect(await registry.ownerOf(3n)).to.equal(addr1.address);
     });
   });
 
   describe("Access Control", function () {
-    it("Should restrict admin functions to admin role", async function () {
-      await expect(
-        registry.connect(addr1).setFixedPrice("test", ethers.parseEther("1.0"))
-      ).to.be.reverted;
+    it("Should have correct initial roles", async function () {
+      const { registry, owner } = await loadFixture(deployRegistryFixture);
 
-      await expect(
-        registry.connect(addr1).setDurationMultiplier(5, 8000)
-      ).to.be.reverted;
-    });
-
-    it("Should allow role delegation", async function () {
+      const adminRole = await registry.DEFAULT_ADMIN_ROLE();
       const registrarRole = await registry.REGISTRAR_ROLE();
-      await registry.grantRole(registrarRole, addr1.address);
+      const pauserRole = await registry.PAUSER_ROLE();
 
-      expect(await registry.hasRole(registrarRole, addr1.address)).to.be.true;
+      expect(await registry.hasRole(adminRole, owner.address)).to.be.true;
+      expect(await registry.hasRole(registrarRole, owner.address)).to.be.true;
+      expect(await registry.hasRole(pauserRole, owner.address)).to.be.true;
     });
 
-    it("Should allow admin to register domains directly", async function () {
+    it("Should allow admin to grant roles", async function () {
+      const { registry, owner, registrar } = await loadFixture(deployRegistryFixture);
+
+      const registrarRole = await registry.REGISTRAR_ROLE();
+
       await expect(
-        registry.register(
-          "admin",
-          addr1.address,
-          oneYear,
-          await resolver.getAddress(),
-          await registry.TLD_NODE()
-        )
-      ).to.emit(registry, "DomainRegistered");
+        registry.grantRole(registrarRole, registrar.address)
+      ).to.emit(registry, "RoleGranted");
+
+      expect(await registry.hasRole(registrarRole, registrar.address)).to.be.true;
     });
 
-    it("Should restrict direct registration to REGISTRAR_ROLE", async function () {
-      await expect(
-        registry.connect(addr1).register(
-          "unauthorized",
-          addr1.address,
-          oneYear,
-          await resolver.getAddress(),
-          await registry.TLD_NODE()
-        )
-      ).to.be.reverted;
-    });
-  });
+    it("Should allow pausing by pauser role", async function () {
+      const { registry, owner } = await loadFixture(deployRegistryFixture);
 
-  describe("Emergency Functions", function () {
-    it("Should allow pausing and unpausing", async function () {
-      await registry.pause();
+      await expect(registry.pause()).to.emit(registry, "Paused");
       expect(await registry.paused()).to.be.true;
 
-      const price = await registry["priceOf(string,uint64)"]("test", oneYear);
+      await expect(registry.unpause()).to.emit(registry, "Unpaused");
+      expect(await registry.paused()).to.be.false;
+    });
+
+    it("Should prevent operations when paused", async function () {
+      const { registry, resolver, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      await registry.pause();
+
+      const price = await registry.priceOf("alice");
+
       await expect(
-        registry.connect(addr1).buyFixedPrice(
-          "test", 
-          await resolver.getAddress(), 
-          oneYear, 
+        registry.register(
+          "alice",
+          owner.address,
+          oneYear,
+          await resolver.getAddress(),
+          TLD_NODE,
           { value: price }
         )
-      ).to.be.revertedWithCustomError(registry, "EnforcedPause");
-
-      await registry.unpause();
-      expect(await registry.paused()).to.be.false;
-      
-      // Should work after unpause
-      await registry.connect(addr1).buyFixedPrice(
-        "test", 
-        await resolver.getAddress(), 
-        oneYear, 
-        { value: price }
-      );
-    });
-
-    it("Should allow emergency withdrawal", async function () {
-      // Add some funds to contract
-      const price = await registry["priceOf(string,uint64)"]("test", oneYear);
-      await registry.connect(addr1).buyFixedPrice(
-        "test", 
-        await resolver.getAddress(), 
-        oneYear, 
-        { value: price }
-      );
-
-      const contractBalance = await ethers.provider.getBalance(await registry.getAddress());
-      expect(contractBalance).to.be.gt(0);
-
-      const ownerBalanceBefore = await ethers.provider.getBalance(owner.address);
-      await registry.withdraw();
-      const ownerBalanceAfter = await ethers.provider.getBalance(owner.address);
-
-      expect(ownerBalanceAfter).to.be.gt(ownerBalanceBefore);
-    });
-
-    it("Should restrict emergency functions to admin", async function () {
-      await expect(
-        registry.connect(addr1).pause()
-      ).to.be.reverted;
-
-      await expect(
-        registry.connect(addr1).withdraw()
-      ).to.be.reverted;
+      ).to.be.revertedWith("Pausable: paused");
     });
   });
 
-  describe("Domain Lifecycle", function () {
-    it("Should handle domain expiry correctly", async function () {
-      const price = await registry["priceOf(string,uint64)"]("expiry", oneYear);
-      await registry.connect(addr1).buyFixedPrice(
-        "expiry",
-        await resolver.getAddress(),
-        oneYear,
-        { value: price }
-      );
+  describe("Availability", function () {
+    it("Should correctly report domain availability", async function () {
+      const { registry, TLD_NODE } = await loadFixture(deployRegistryFixture);
 
-      const node = await registry.getNodeOfToken(1n);
-      const domain = await registry.getDomain(node);
-      
-      // Should not be available immediately after registration
+      const node = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], 
+        [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("available"))]));
+
+      expect(await registry.isAvailable(node)).to.be.true;
+    });
+
+    it("Should report registered domain as unavailable", async function () {
+      const { registry, node } = await loadFixture(registerDomainFixture);
+
       expect(await registry.isAvailable(node)).to.be.false;
-      
-      // Domain should still have valid expiry
-      expect(domain.expiry).to.be.gt(BigInt(Math.floor(Date.now() / 1000)));
     });
 
-    it("Should handle grace period", async function () {
-      // Test requires time manipulation which is complex in this test
-      // This is a placeholder for grace period testing
-      expect(await registry.gracePeriod()).to.equal(90 * 24 * 3600); // 90 days
+    it("Should report expired domain as available after grace period", async function () {
+      const { registry, node } = await loadFixture(registerDomainFixture);
+
+      // Fast forward past expiry and grace period
+      await time.increase(oneYear + gracePeriod + 1);
+
+      expect(await registry.isAvailable(node)).to.be.true;
     });
   });
 
-  describe("Gas Efficiency", function () {
-    it("Should register domains efficiently", async function () {
-      const price = await registry["priceOf(string,uint64)"]("gastest", oneYear);
-      
-      const tx = await registry.connect(addr1).buyFixedPrice(
-        "gastest",
-        await resolver.getAddress(),
-        oneYear,
-        { value: price }
-      );
-      
-      const receipt = await tx.wait();
-      console.log(`Domain registration gas: ${receipt!.gasUsed}`);
-      
-      // Should be reasonable gas usage
-      expect(receipt!.gasUsed).to.be.lt(300000n);
+  describe("Admin Functions", function () {
+    it("Should allow admin to set base fee", async function () {
+      const { registry, owner } = await loadFixture(deployRegistryFixture);
+
+      const newFee = ethers.parseEther("0.02");
+      await registry.setBaseFee(newFee);
+
+      expect(await registry.baseFee()).to.equal(newFee);
     });
 
-    it("Should transfer NFTs efficiently", async function () {
-      const price = await registry["priceOf(string,uint64)"]("transfer", oneYear);
-      await registry.connect(addr1).buyFixedPrice(
-        "transfer",
-        await resolver.getAddress(),
+    it("Should allow admin to set length premium", async function () {
+      const { registry, owner } = await loadFixture(deployRegistryFixture);
+
+      const newPremium = ethers.parseEther("2");
+      await registry.setLengthPremium(1, newPremium);
+
+      expect(await registry.lengthPremium(1)).to.equal(newPremium);
+    });
+
+    it("Should allow admin to withdraw funds", async function () {
+      const { registry, resolver, owner, user1, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      // Register a domain to add funds
+      const price = await registry.priceOf("alice");
+      await registry.connect(user1).register(
+        "alice",
+        user1.address,
         oneYear,
+        await resolver.getAddress(),
+        TLD_NODE,
         { value: price }
       );
 
-      const tokenId = 2n;
-      const tx = await registry.connect(addr1).transferFrom(
-        addr1.address,
-        addr2.address,
-        tokenId
-      );
+      const initialBalance = await ethers.provider.getBalance(owner.address);
       
-      const receipt = await tx.wait();
-      console.log(`NFT transfer gas: ${receipt!.gasUsed}`);
+      await expect(registry.withdraw()).to.not.be.reverted;
       
-      // Should be reasonable gas usage
-      expect(receipt!.gasUsed).to.be.lt(100000n);
+      const finalBalance = await ethers.provider.getBalance(owner.address);
+      expect(finalBalance).to.be.gt(initialBalance);
+    });
+
+    it("Should prevent non-admin from admin functions", async function () {
+      const { registry, user1 } = await loadFixture(deployRegistryFixture);
+
+      await expect(
+        registry.connect(user1).setBaseFee(ethers.parseEther("0.02"))
+      ).to.be.revertedWith("AccessControl:");
+
+      await expect(
+        registry.connect(user1).withdraw()
+      ).to.be.revertedWith("AccessControl:");
     });
   });
 
   describe("Edge Cases", function () {
-    it("Should handle maximum duration", async function () {
-      const maxDuration = await registry.maxRegistration();
-      const price = await registry["priceOf(string,uint64)"]("maxduration", Number(maxDuration));
-      
-      await registry.connect(addr1).buyFixedPrice(
-        "maxduration",
-        await resolver.getAddress(),
-        Number(maxDuration),
-        { value: price }
-      );
+    it("Should handle zero value registrations for free domains", async function () {
+      const { registry, resolver, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
 
-      expect(await registry.ownerOf(1n)).to.equal(addr1.address);
+      // Set custom price to 0
+      const node = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], 
+        [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("free"))]));
+      
+      await registry.setCustomPrice(node, 0);
+
+      await expect(
+        registry.register(
+          "free",
+          owner.address,
+          oneYear,
+          await resolver.getAddress(),
+          TLD_NODE,
+          { value: 0 }
+        )
+      ).to.not.be.reverted;
     });
 
-    it("Should reject duration beyond maximum", async function () {
-      const maxDuration = await registry.maxRegistration();
-      const price = await registry["priceOf(string,uint64)"]("toolong", oneYear);
-      
+    it("Should handle maximum length domain names", async function () {
+      const { registry, resolver, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      const maxName = "a".repeat(63); // Max length
+      const price = await registry.priceOf(maxName);
+
       await expect(
-        registry.connect(addr1).buyFixedPrice(
-          "toolong",
+        registry.register(
+          maxName,
+          owner.address,
+          oneYear,
           await resolver.getAddress(),
-          Number(maxDuration) + 1,
+          TLD_NODE,
           { value: price }
         )
-      ).to.be.revertedWith("Duration too long");
+      ).to.not.be.reverted;
     });
 
-    it("Should handle minimum valid domain names", async function () {
-      const price = await registry["priceOf(string,uint64)"]("a", oneYear);
-      
-      await registry.connect(addr1).buyFixedPrice(
-        "a",
-        await resolver.getAddress(),
-        oneYear,
-        { value: price }
-      );
+    it("Should handle minimum duration registrations", async function () {
+      const { registry, resolver, owner, TLD_NODE } = await loadFixture(deployRegistryFixture);
 
-      expect(await registry.ownerOf(1n)).to.equal(addr1.address);
+      const minDuration = 28 * 24 * 60 * 60; // 28 days
+      const price = await registry.priceOf("alice");
+
+      await expect(
+        registry.register(
+          "alice",
+          owner.address,
+          minDuration,
+          await resolver.getAddress(),
+          TLD_NODE,
+          { value: price }
+        )
+      ).to.not.be.reverted;
+    });
+  });
+
+  describe("Events", function () {
+    it("Should emit DomainRegistered with correct parameters", async function () {
+      const { registry, resolver, user1, TLD_NODE } = await loadFixture(deployRegistryFixture);
+
+      const price = await registry.priceOf("alice");
+      const node = ethers.keccak256(ethers.solidityPacked(["bytes32", "bytes32"], 
+        [TLD_NODE, ethers.keccak256(ethers.toUtf8Bytes("alice"))]));
+
+      await expect(
+        registry.connect(user1).register(
+          "alice",
+          user1.address,
+          oneYear,
+          await resolver.getAddress(),
+          TLD_NODE,
+          { value: price }
+        )
+      ).to.emit(registry, "DomainRegistered")
+       .withArgs(node, "alice", user1.address, await time.latest() + oneYear, price);
+    });
+
+    it("Should emit ResolverChanged when resolver is updated", async function () {
+      const { registry, user1, user2, node } = await loadFixture(registerDomainFixture);
+
+      await expect(
+        registry.connect(user1).setResolver(node, user2.address)
+      ).to.emit(registry, "ResolverChanged")
+       .withArgs(node, user2.address);
     });
   });
 });
