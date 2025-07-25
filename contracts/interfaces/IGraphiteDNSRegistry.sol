@@ -1,6 +1,6 @@
 // contracts/interfaces/IGraphiteDNSRegistry.sol
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.18;
 
 interface IGraphiteDNSRegistry {
     struct Domain {
